@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test / tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Model weights (downloaded by `setup`, tens of GB, never committed)
+models/
+
+# Runtime data: personal meeting recordings, transcripts, todo.md, calendar
+# cache, agent traces. This is user-local state, not project source, and
+# data/ maintains its own separate git history for internal backup snapshots
+# (see cli/git_backup.py) -- it must never be nested inside this repo.
+data/
+
+# Scratch/temp audio buffers written during recording
+tmp/
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

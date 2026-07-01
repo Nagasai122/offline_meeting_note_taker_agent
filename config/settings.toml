@@ -1,0 +1,37 @@
+[paths]
+data_dir = "data"
+tmp_dir = "tmp"
+models_dir = "models"          # where downloaded weights are cached locally after `setup`
+
+[llm]
+backend = "llama-server"        # "llama-server" | "vllm"
+active_profile = "qwen2_5_7b_gguf"  # dense 7B, not 30B-class MoE -- see llm/model_profiles.py notes
+host = "127.0.0.1"               # loopback only — never change to 0.0.0.0
+port = 8080
+startup_timeout_seconds = 300      # raised from 120: cold-loading a multi-GB file plus CUDA init can exceed 120s
+health_check_path = "/health"
+
+[whisper]
+model = "base"                   # changed from "medium" to "base" for faster execution
+device = "cuda"
+compute_type = "int8_float16"    # good VRAM/accuracy balance on 12-16GB cards
+diarisation_enabled = false      # best-effort only; requires the optional [diarisation] extra + a HF token
+
+[privacy]
+# Environment variables applied before ANY subprocess launch (llm or whisper).
+# These disable telemetry/usage-reporting in third-party libraries.
+disable_telemetry_env = [
+    "HF_HUB_OFFLINE=1",
+    "HF_HUB_DISABLE_TELEMETRY=1",
+    "DO_NOT_TRACK=1",
+    "VLLM_NO_USAGE_STATS=1",     # re-verify flag name against installed vLLM version
+]
+tmp_audio_ttl_seconds = 3600         # 3600 = 1 hour grace period before sweep
+
+[concurrency]
+lock_path = "data/state/.lock"
+lock_timeout_seconds = 10
+
+[agent]
+max_iterations = 12               # ceiling on ReAct turns per run (M5)
+trace_dir = "data/traces"         # JSONL audit trail, one file per run

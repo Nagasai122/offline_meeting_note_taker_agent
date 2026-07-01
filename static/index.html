@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Meeting Agent Dashboard</title>
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+    <!-- FontAwesome for Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="/static/index.css">
+</head>
+<body>
+    <div class="background-orbs">
+        <div class="orb orb-1"></div>
+        <div class="orb orb-2"></div>
+        <div class="orb orb-3"></div>
+    </div>
+    
+    <div class="app-container">
+        <!-- Sidebar Navigation -->
+        <nav class="sidebar glass-panel">
+            <div class="logo">
+                <i class="fa-solid fa-robot"></i>
+                <h2>Nemotron</h2>
+            </div>
+            <ul class="nav-links" role="tablist">
+                <li id="nav-dashboard" class="active" role="tab" tabindex="0" aria-selected="true" onclick="switchTab('dashboard')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('dashboard');}"><i class="fa-solid fa-house"></i> Dashboard</li>
+                <li id="nav-calendar" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('calendar')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('calendar');}"><i class="fa-solid fa-calendar-days"></i> Calendar</li>
+                <li id="nav-meetings" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('meetings')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('meetings');}"><i class="fa-solid fa-folder-open"></i> Past Meetings</li>
+                <li id="nav-tasks" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('tasks')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('tasks');}"><i class="fa-solid fa-list-check"></i> Tasks</li>
+                <li id="nav-review" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('review')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('review');}"><i class="fa-solid fa-user-check"></i> Needs Review <span id="review-badge" class="badge" style="display:none;background:#f59e0b;"></span></li>
+                <li id="nav-system" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('system')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('system');}"><i class="fa-solid fa-sliders"></i> System</li>
+            </ul>
+            <div class="system-status">
+                <span class="status-indicator"></span>
+                <p>System Online</p>
+                <small>127.0.0.1:8000</small>
+            </div>
+        </nav>
+
+        <!-- Main Content -->
+        <main class="content">
+            <header class="top-bar">
+                <div class="greeting">
+                    <h1 id="greeting-text">Good morning.</h1>
+                    <p>Here is your daily briefing.</p>
+                </div>
+                <div class="recording-controls glass-panel">
+                    <div id="recording-status" class="recording-idle" style="display: flex; align-items: center; gap: 10px; width: 100%;">
+                        <i class="fa-solid fa-microphone"></i>
+                        <span id="recording-status-text">Ready to Record</span>
+                    </div>
+                    <div id="pre-meeting-controls" style="width: 100%; margin-top: 10px;">
+                        <label for="meeting-context" class="sr-only">Meeting agenda or context</label>
+                        <textarea id="meeting-context" aria-label="Meeting agenda or context" placeholder="Optional: Meeting agenda or context (e.g. 1:1 sync with John)" rows="2" style="width: 100%; padding: 8px; border-radius: 5px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.2); color: white;"></textarea>
+                    </div>
+                    <div style="display: flex; gap: 10px; margin-top: 10px;">
+                        <button id="btn-toggle-record" class="btn-primary" style="flex: 1;">
+                            Start Meeting
+                        </button>
+                        <button id="btn-highlight" class="btn-primary hidden" style="background: var(--accent); flex: 1;">
+                            <i class="fa-solid fa-bookmark"></i> Highlight
+                        </button>
+                    </div>
+                </div>
+            </header>
+            
+            <div id="live-transcript-panel" class="glass-panel hidden" style="margin-bottom: 2rem;">
+                <h3 style="margin-bottom: 10px; color: var(--accent);">
+                    <i class="fa-solid fa-satellite-dish fa-fade"></i> Live Transcription
+                    <span id="live-source-badge" style="font-size:0.75rem;font-weight:400;margin-left:0.75rem;padding:2px 8px;border-radius:12px;background:rgba(255,255,255,0.1);color:var(--text-muted);"></span>
+                </h3>
+                <div id="live-transcript-text" style="max-height: 150px; overflow-y: auto; font-family: monospace; color: var(--text-muted); padding: 10px; background: rgba(0,0,0,0.3); border-radius: 5px;">
+                    Starting...
+                </div>
+            </div>
+
+            <div id="processing-banner" class="glass-panel hidden">
+                <i class="fa-solid fa-microchip fa-spin"></i>
+                <div>
+                    <h3>Processing...</h3>
+                    <p style="color: var(--text-muted); font-size: 0.9rem;">The AI is generating your notes. This usually takes a minute or two.</p>
+                </div>
+            </div>
+
+            <div id="error-banner" class="glass-panel hidden" style="background: rgba(239, 68, 68, 0.2); border-left: 4px solid #ef4444;">
+                <i class="fa-solid fa-triangle-exclamation" style="color: #ef4444; font-size: 2rem;"></i>
+                <div>
+                    <h3 style="color: #ef4444;">Processing Failed</h3>
+                    <p id="error-text" style="color: var(--text-muted); font-size: 0.9rem; font-family: monospace;"></p>
+                </div>
+            </div>
+
+            <div id="view-dashboard" class="dashboard-grid">
+                <!-- Left Column -->
+                <div class="col-main">
+                    <section class="card glass-panel">
+                        <div class="card-header">
+                            <h2><i class="fa-solid fa-list-check" style="color: var(--primary);"></i> Action Items</h2>
+                        </div>
+                        <div class="widget-body" id="task-list">
+                            <div class="loading-shimmer"></div>
+                        </div>
+                    </section>
+                </div>
+                <!-- Right Column -->
+                <div class="col-side">
+                    <section class="widget glass-panel">
+                        <div class="widget-header">
+                            <h3><i class="fa-solid fa-calendar"></i> Today's Schedule</h3>
+                            <span class="badge" id="meeting-count">0</span>
+                            <button id="btn-sync-calendar" class="btn-icon" title="Sync Outlook calendar (on-demand, local COM only)" aria-label="Sync calendar" onclick="syncCalendar()">
+                                <i class="fa-solid fa-rotate"></i>
+                            </button>
+                        </div>
+                        <div class="widget-body" id="calendar-list">
+                            <!-- Populated by JS -->
+                            <div class="loading-shimmer"></div>
+                        </div>
+                    </section>
+                </div>
+                
+                <!-- Notes Section -->
+                <section class="widget glass-panel slide-up" style="animation-delay: 0.2s; grid-column: 1 / -1;">
+                    <div class="widget-header">
+                        <h3><i class="fa-solid fa-file-lines"></i> Recent Notes</h3>
+                        <span class="badge" id="notes-count">0</span>
+                    </div>
+                    <div class="widget-body" id="notes-list">
+                        <!-- Populated by JS -->
+                        <div class="empty-state">No recent notes found.</div>
+                    </div>
+                </section>
+            </div>
+            
+            <div id="view-calendar" class="hidden">
+                <section class="card glass-panel">
+                    <div class="card-header">
+                        <h2><i class="fa-solid fa-calendar-days" style="color: var(--primary);"></i> Upcoming Schedule (7 Days)</h2>
+                    </div>
+                    <div id="full-calendar-list" style="display: flex; flex-direction: column; gap: 15px;">
+                        <p style="color: var(--text-muted);">Loading calendar...</p>
+                    </div>
+                </section>
+            </div>
+
+            <div id="view-meetings" class="hidden">
+                <section class="card glass-panel">
+                    <div class="card-header">
+                        <h2><i class="fa-solid fa-folder-open" style="color: var(--primary);"></i> Past Meetings Archive</h2>
+                    </div>
+                    <!-- Search box -->
+                    <div style="padding: 0 0 1rem;">
+                        <div style="position:relative;">
+                            <i class="fa-solid fa-magnifying-glass" style="position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--text-muted);pointer-events:none;"></i>
+                            <input type="search" id="meetings-search"
+                                   placeholder="Search meetings by keyword…"
+                                   aria-label="Search past meetings"
+                                   style="width:100%;padding:10px 12px 10px 36px;background:rgba(0,0,0,0.3);
+                                          border:1px solid rgba(255,255,255,0.15);border-radius:8px;
+                                          color:white;font-size:0.95rem;box-sizing:border-box;"
+                                   oninput="debouncedSearch(this.value)">
+                        </div>
+                        <div id="search-results" style="display:none;margin-top:0.75rem;"></div>
+                    </div>
+                    <div id="full-notes-list" style="display: flex; flex-direction: column; gap: 15px;">
+                        <p style="color: var(--text-muted);">Loading notes...</p>
+                    </div>
+                </section>
+            </div>
+            
+            <!-- Needs Review view -->
+            <div id="view-review" class="hidden">
+                <section class="card glass-panel">
+                    <div class="card-header">
+                        <h2><i class="fa-solid fa-user-check" style="color: var(--primary);"></i> Human-in-the-Loop Review</h2>
+                    </div>
+                    <div id="review-loading" style="color:var(--text-muted);padding:1rem;">Loading review queue...</div>
+
+                    <!-- Awaiting Review -->
+                    <div id="review-awaiting-section">
+                        <h3 style="margin:1.5rem 0 0.75rem;color:var(--accent);">
+                            <i class="fa-solid fa-hourglass-half"></i> Awaiting Your Review
+                        </h3>
+                        <div id="review-awaiting-list"></div>
+                    </div>
+
+                    <!-- Awaiting Apply -->
+                    <div id="review-apply-section">
+                        <h3 style="margin:1.5rem 0 0.75rem;color:#10b981;">
+                            <i class="fa-solid fa-circle-check"></i> Reviewed — Ready to Apply
+                        </h3>
+                        <div id="review-apply-list"></div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- System / Server Control view -->
+            <div id="view-system" class="hidden">
+                <section class="card glass-panel">
+                    <div class="card-header">
+                        <h2><i class="fa-solid fa-sliders" style="color:var(--primary);"></i> System Control</h2>
+                    </div>
+
+                    <!-- Status row -->
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-bottom:1.5rem;" id="server-status-cards">
+                        <div class="glass-panel" style="padding:1rem;text-align:center;">
+                            <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.3rem;">Dashboard Uptime</div>
+                            <div id="stat-uptime" style="font-size:1.3rem;font-weight:600;color:var(--primary);">--</div>
+                        </div>
+                        <div class="glass-panel" style="padding:1rem;text-align:center;">
+                            <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.3rem;">Web PID</div>
+                            <div id="stat-pid" style="font-size:1.3rem;font-weight:600;color:var(--primary);">--</div>
+                        </div>
+                        <div class="glass-panel" style="padding:1rem;text-align:center;">
+                            <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.3rem;">LLM Server</div>
+                            <div id="stat-llm" style="font-size:1.1rem;font-weight:600;">--</div>
+                        </div>
+                        <div class="glass-panel" style="padding:1rem;text-align:center;">
+                            <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.3rem;">Session</div>
+                            <div id="stat-session" style="font-size:0.95rem;font-weight:600;color:var(--text-muted);">Idle</div>
+                        </div>
+                    </div>
+
+                    <!-- Web server controls -->
+                    <div class="glass-panel" style="padding:1.2rem;margin-bottom:1rem;">
+                        <h3 style="margin:0 0 0.8rem;font-size:1rem;"><i class="fa-solid fa-globe"></i> Web Dashboard</h3>
+                        <p style="font-size:0.85rem;color:var(--text-muted);margin-bottom:1rem;">
+                            Restart the dashboard server to pick up code changes without going to the terminal.
+                            The page will automatically reload once the server is back.
+                        </p>
+                        <button class="btn-primary" onclick="restartWebServer()"
+                                style="background:linear-gradient(135deg,#f59e0b,#d97706);">
+                            <i class="fa-solid fa-rotate-right"></i> Restart Dashboard
+                        </button>
+                        <span id="restart-status" style="margin-left:1rem;font-size:0.85rem;color:var(--text-muted);"></span>
+                    </div>
+
+                    <!-- LLM server controls -->
+                    <div class="glass-panel" style="padding:1.2rem;margin-bottom:1rem;">
+                        <h3 style="margin:0 0 0.8rem;font-size:1rem;"><i class="fa-solid fa-microchip"></i> LLM Server (llama-server)</h3>
+                        <p style="font-size:0.85rem;color:var(--text-muted);margin-bottom:1rem;">
+                            Manage the local LLM server independently of the recording pipeline.
+                            Useful to free VRAM or pre-warm before a meeting.
+                        </p>
+                        <div style="display:flex;gap:0.75rem;flex-wrap:wrap;">
+                            <button class="btn-primary" onclick="llmStart()"
+                                    style="background:linear-gradient(135deg,#10b981,#059669);">
+                                <i class="fa-solid fa-play"></i> Start LLM Server
+                            </button>
+                            <button class="btn-primary" onclick="llmStop()"
+                                    style="background:linear-gradient(135deg,#ef4444,#dc2626);">
+                                <i class="fa-solid fa-stop"></i> Stop LLM Server
+                            </button>
+                        </div>
+                        <div id="llm-control-msg" style="margin-top:0.75rem;font-size:0.85rem;color:var(--text-muted);"></div>
+                    </div>
+
+                    <!-- Data reset -->
+                    <div class="glass-panel" style="padding:1.2rem;border:1px solid rgba(239,68,68,0.3);">
+                        <h3 style="margin:0 0 0.8rem;font-size:1rem;color:#f87171;"><i class="fa-solid fa-trash"></i> Reset All Data</h3>
+                        <p style="font-size:0.85rem;color:var(--text-muted);margin-bottom:1rem;">
+                            Delete all meeting records, session state, pending reviews, and clear todo.md.
+                            <strong style="color:#f87171;">This cannot be undone.</strong>
+                        </p>
+                        <button class="btn-primary" onclick="confirmResetData()"
+                                style="background:linear-gradient(135deg,#ef4444,#b91c1c);">
+                            <i class="fa-solid fa-trash-can"></i> Reset All Data
+                        </button>
+                        <span id="reset-status" style="margin-left:1rem;font-size:0.85rem;color:var(--text-muted);"></span>
+                    </div>
+                </section>
+            </div>
+
+            <div id="view-tasks" class="hidden">
+                <section class="card glass-panel">
+                    <div class="card-header">
+                        <h2><i class="fa-solid fa-list-check" style="color: var(--primary);"></i> All Action Items</h2>
+                        <span class="badge" id="full-task-count">0</span>
+                    </div>
+                    <div class="widget-body" id="full-task-list">
+                        <!-- Populated by JS -->
+                        <div class="loading-shimmer"></div>
+                    </div>
+                </section>
+            </div>
+            
+        </main>
+    </div>
+
+    <!-- Meeting detail modal -->
+    <div id="meeting-detail-modal"
+         role="dialog" aria-modal="true" aria-labelledby="modal-session-title"
+         style="display:none;position:fixed;inset:0;z-index:1000;
+                background:rgba(0,0,0,0.75);overflow-y:auto;padding:2rem 1rem;">
+        <div style="max-width:860px;margin:0 auto;background:#1e1e2e;border-radius:12px;
+                    border:1px solid rgba(255,255,255,0.12);padding:1.5rem;position:relative;">
+            <button onclick="closeMeetingDetail()" aria-label="Close"
+                    style="position:absolute;top:1rem;right:1rem;background:none;border:none;
+                           color:var(--text-muted);font-size:1.4rem;cursor:pointer;">&#x2715;</button>
+            <h2 id="modal-session-title" style="color:var(--primary);margin-bottom:1rem;"></h2>
+
+            <div id="modal-summary" style="display:none;margin-bottom:1.5rem;">
+                <h3 style="color:var(--accent);margin-bottom:0.5rem;">Summary</h3>
+                <div id="modal-summary-body"
+                     style="background:rgba(0,0,0,0.3);border-radius:8px;padding:1rem;
+                            white-space:pre-wrap;font-size:0.9rem;color:var(--text-muted);"></div>
+            </div>
+
+            <div id="modal-actions" style="display:none;margin-bottom:1.5rem;">
+                <h3 style="color:#10b981;margin-bottom:0.5rem;">Action Items</h3>
+                <ul id="modal-actions-list" style="list-style:none;padding:0;margin:0;"></ul>
+            </div>
+
+            <div id="modal-highlights" style="display:none;margin-bottom:1.5rem;">
+                <h3 style="color:#f59e0b;margin-bottom:0.5rem;">Highlights</h3>
+                <ul id="modal-highlights-list" style="list-style:none;padding:0;margin:0;"></ul>
+            </div>
+
+            <div id="modal-transcript" style="display:none;">
+                <h3 style="color:var(--text-muted);margin-bottom:0.5rem;">
+                    Full Transcript
+                    <button onclick="toggleTranscript()" id="btn-toggle-transcript"
+                            style="font-size:0.75rem;margin-left:0.5rem;padding:2px 8px;
+                                   background:rgba(255,255,255,0.1);border:none;border-radius:4px;
+                                   color:var(--text-muted);cursor:pointer;">show</button>
+                </h3>
+                <div id="modal-transcript-body"
+                     style="display:none;background:rgba(0,0,0,0.3);border-radius:8px;padding:1rem;
+                            white-space:pre-wrap;font-size:0.82rem;color:var(--text-muted);
+                            max-height:400px;overflow-y:auto;font-family:monospace;"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

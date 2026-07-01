@@ -1,0 +1,224 @@
+"""
+Core, testable logic for the M6 `review` and `apply` CLI commands.
+
+Deliberately kept outside mcp_server/ entirely (not merely outside server.py's
+import graph) -- see cli/capability.py's docstring for why structural absence
+from the agent-facing package is itself part of the enforcement story for
+`apply_reviewed_update`, per critique amendment 2(b).
+
+Split from cli/main.py so that the decision logic (parsing, conflict
+detection, merging) is unit-testable without going through Typer's
+interactive prompts -- `cli/main.py`'s `review` command owns the
+human-interaction loop (accept/reject/edit prompts) and calls
+`build_review_decision`/`write_reviewed_decisions` here; `apply` owns nothing
+but argument wiring and calls `apply_reviewed_update` here.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
+from cli.capability import CapabilityToken, require_capability_token
+from cli.git_backup import commit_all, ensure_repo
+from mcp_server import state as state_mod
+from mcp_server.schemas import validate_session_id
+from mcp_server.todo import TodoFile, TodoItem, TodoFileUnparsableError, format_todo_file, parse_todo
+
+
+@dataclass
+class ReviewDecision:
+    id: str
+    decision: str  # "accept" | "reject"
+    description: str
+    owner: str | None
+    due_date: str | None
+    session_id: str | None
+
+
+def load_pending_items(pending_review_path: Path | str) -> list[TodoItem]:
+    """The draft written by propose_todo_update (M4) is already in the exact
+    `- [ ] desc <!-- meta: {...} -->` checklist format todo.py understands, so
+    parsing it is just parse_todo() against that path -- no separate parser
+    needed. Every item in a fresh draft has done=False; that is not meaningful
+    here and is ignored by the review step."""
+    pending_review_path = Path(pending_review_path)
+    if not pending_review_path.exists():
+        raise FileNotFoundError(f"No pending review draft found at {pending_review_path}.")
+    return parse_todo(pending_review_path).items
+
+
+def write_reviewed_decisions(reviewed_path: Path | str, decisions: list[ReviewDecision]) -> None:
+    reviewed_path = Path(reviewed_path)
+    reviewed_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = [
+        {
+            "id": d.id, "decision": d.decision, "description": d.description,
+            "owner": d.owner, "due_date": d.due_date, "session_id": d.session_id,
+        }
+        for d in decisions
+    ]
+    reviewed_path.write_text(json.dumps(payload, indent=2))
+
+
+def load_reviewed_decisions(reviewed_path: Path | str) -> list[ReviewDecision]:
+    reviewed_path = Path(reviewed_path)
+    if not reviewed_path.exists():
+        raise FileNotFoundError(f"No reviewed-decisions file found at {reviewed_path}.")
+    raw = json.loads(reviewed_path.read_text())
+    return [ReviewDecision(**entry) for entry in raw]
+
+
+def complete_review(
+    session_id: str,
+    decisions: list[ReviewDecision],
+    pending_review_dir: Path | str,
+    state_dir: Path | str,
+    lock_path: Path | str,
+    lock_timeout: float,
+) -> dict:
+    """Persist the human's accept/reject/edit decisions and transition
+    PROPOSED -> REVIEWED. Pure state/IO -- the interactive prompting itself
+    lives in cli/main.py's `review` command, not here."""
+    validate_session_id(session_id)
+    reviewed_path = Path(pending_review_dir) / f"{session_id}.reviewed.json"
+    write_reviewed_decisions(reviewed_path, decisions)
+    session = state_mod.transition(
+        state_dir, session_id, state_mod.State.REVIEWED, lock_path, lock_timeout,
+        reviewed_path=str(reviewed_path),
+    )
+    accepted = sum(1 for d in decisions if d.decision == "accept")
+    return {
+        "session_id": session_id, "state": session.state.value,
+        "reviewed_path": str(reviewed_path), "accepted_count": accepted,
+        "rejected_count": len(decisions) - accepted,
+    }
+
+
+def apply_reviewed_update(
+    token: CapabilityToken,
+    session_id: str,
+    pending_review_dir: Path | str,
+    todo_path: Path | str,
+    data_dir: Path | str,
+    state_dir: Path | str,
+    lock_path: Path | str,
+    lock_timeout: float,
+) -> dict:
+    """The only function in this project permitted to write data/todo.md.
+
+    Gated by `token` (critique amendment 2(a)) and by being structurally
+    absent from mcp_server/ (amendment 2(b) -- see cli/capability.py).
+
+    Conflict semantics (PARTIAL_APPLY_CONFLICT, amendment 3): an accepted item
+    is considered conflicting if-and-only-if its `id` already exists among the
+    items currently in todo.md. Given ids are freshly minted uuids per
+    proposal (mcp_server/tools/review.py), this is in practice an idempotent
+    double-apply guard rather than a generic duplicate-content detector --
+    deliberately so: detecting semantic duplicates (e.g. two differently-worded
+    descriptions of "the same" action item) is a much harder, precision/recall
+    trade-off-laden problem that risks silently dropping a legitimate item on
+    a false-positive match. That is flagged here as a deliberately deferred
+    enhancement, not an oversight, should the user later want it.
+
+    On a conflict, that single item is skipped (not applied); the rest of the
+    accepted items still apply; both the existing todo.md item and the skipped
+    incoming item are returned under "conflicts" for manual reconciliation, per
+    amendment 3's "both versions are shown" requirement -- this function does
+    not attempt to reconcile them itself.
+    """
+    require_capability_token(token)
+    validate_session_id(session_id)
+
+    # Fail fast, before any I/O or git mutation, if the session is not in
+    # REVIEWED state. Originally this was only discovered by the final
+    # transition() call below, at which point todo.md had already been
+    # rewritten and committed -- harmless by chance on a pure re-apply (every
+    # decision collides, so the rewrite is a no-op), but not guaranteed
+    # harmless in general (e.g. a stale reviewed.json left over after a
+    # session moved on to FAILED some other way). Checked here explicitly so
+    # an invalid-state apply is always a clean no-op, never a partially
+    # executed one. Found via manual stress testing of a double-apply.
+    state_dir = Path(state_dir)
+    current = state_mod.load_session_state(state_dir, session_id)
+    if current.state != state_mod.State.REVIEWED:
+        raise state_mod.InvalidTransitionError(
+            f"Cannot apply session '{session_id}': current state is "
+            f"{current.state.value}, expected REVIEWED. No changes were made."
+        )
+
+    data_dir = Path(data_dir)
+    todo_path = Path(todo_path)
+    reviewed_path = Path(pending_review_dir) / f"{session_id}.reviewed.json"
+    decisions = load_reviewed_decisions(reviewed_path)
+
+    ensure_repo(data_dir)
+    pre_hash = commit_all(data_dir, f"pre-apply snapshot: session '{session_id}'")
+
+    try:
+        existing = parse_todo(todo_path)
+    except TodoFileUnparsableError as exc:
+        state_mod.transition(
+            state_dir, session_id, state_mod.State.FAILED, lock_path, lock_timeout,
+            error=f"TODO_FILE_UNPARSEABLE: {exc}",
+        )
+        raise
+
+    existing_by_id = {item.id: item for item in existing.items if item.id is not None}
+
+    applied: list[TodoItem] = []
+    conflicts: list[dict] = []
+    for decision in decisions:
+        if decision.decision != "accept":
+            continue
+        if decision.id in existing_by_id:
+            conflicts.append({
+                "id": decision.id,
+                "existing": _item_to_dict(existing_by_id[decision.id]),
+                "incoming": {
+                    "description": decision.description, "owner": decision.owner,
+                    "due_date": decision.due_date, "session_id": decision.session_id,
+                },
+            })
+            continue
+        applied.append(
+            TodoItem(
+                description=decision.description, done=False, id=decision.id,
+                owner=decision.owner, due_date=decision.due_date, session_id=decision.session_id,
+            )
+        )
+
+    merged = TodoFile(items=existing.items + applied)
+    todo_path.parent.mkdir(parents=True, exist_ok=True)
+    todo_path.write_text(format_todo_file(merged))
+
+    post_hash = commit_all(data_dir, f"post-apply: session '{session_id}' ({len(applied)} item(s))")
+
+    session = state_mod.transition(
+        state_dir, session_id, state_mod.State.APPLIED, lock_path, lock_timeout,
+        applied_count=len(applied), conflict_count=len(conflicts),
+        conflicts=conflicts, pre_apply_commit=pre_hash, post_apply_commit=post_hash,
+    )
+
+    # The transition() call above writes state_dir/<session_id>.json AFTER
+    # the post-apply commit was taken, so that write is itself left
+    # uncommitted by the commit above -- amendment 5's git undo path must
+    # never leave data/ dirty on return. A trailing commit closes that gap.
+    # Its hash is deliberately not threaded back into the session's own
+    # metadata (that would need a second transition purely to record a hash
+    # whose only consumer is `git log`/`git revert`, for marginal benefit).
+    commit_all(data_dir, f"post-apply state record: session '{session_id}'")
+
+    return {
+        "session_id": session_id, "state": session.state.value,
+        "applied_count": len(applied), "conflicts": conflicts,
+        "pre_apply_commit": pre_hash, "post_apply_commit": post_hash,
+    }
+
+
+def _item_to_dict(item: TodoItem) -> dict:
+    return {
+        "id": item.id, "description": item.description, "done": item.done,
+        "owner": item.owner, "due_date": item.due_date, "session_id": item.session_id,
+    }
