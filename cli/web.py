@@ -1366,8 +1366,25 @@ async def search_meetings_endpoint(q: str = ""):
 
     meetings_dir = Path(settings.paths.data_dir) / "meetings"
     state_dir = Path(settings.paths.data_dir) / "state"
+
+    # Hybrid (BM25 + local dense vectors) when the semantic index exists;
+    # transparently BM25-only otherwise -- cli/semantic_search.py degrades
+    # rather than failing the search box.
+    db_path = Path(settings.paths.data_dir) / "semantic_index.db"
+    if db_path.exists():
+        from cli.semantic_search import hybrid_search
+
+        hybrid = await asyncio.to_thread(
+            hybrid_search, q.strip(), meetings_dir, state_dir, db_path
+        )
+        return JSONResponse(jsonable_encoder({
+            "semantic": hybrid["semantic_available"],
+            "results": hybrid["results"],
+        }))
+
     results = search_meetings(meetings_dir, q.strip(), state_dir=state_dir)
     return JSONResponse(jsonable_encoder({
+        "semantic": False,
         "results": [
             {
                 "session_id": r.session_id,
@@ -1378,6 +1395,27 @@ async def search_meetings_endpoint(q: str = ""):
             for r in results
         ]
     }))
+
+
+@app.post("/api/search/reindex")
+async def post_search_reindex():
+    """(Re)build the local semantic index over reviewed sessions. Explicitly
+    user-triggered (embedding a large history takes seconds-to-minutes on
+    CPU); the index file is derived data under data/, safe to delete."""
+    from cli.semantic_search import refresh_index
+
+    meetings_dir = Path(settings.paths.data_dir) / "meetings"
+    state_dir = Path(settings.paths.data_dir) / "state"
+    db_path = Path(settings.paths.data_dir) / "semantic_index.db"
+    try:
+        stats = await asyncio.to_thread(refresh_index, meetings_dir, state_dir, db_path)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the caller, not a 500
+        return JSONResponse(
+            {"error": f"Semantic indexing unavailable: {exc}. "
+                      "Run `meeting-agent setup` to fetch the embedding model."},
+            status_code=503,
+        )
+    return JSONResponse({"status": "indexed", **stats})
 
 
 # ── Per-meeting detail view ───────────────────────────────────────────────────

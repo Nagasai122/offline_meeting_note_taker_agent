@@ -114,6 +114,19 @@ def setup(
         download_model(whisper_model)
         typer.echo(f"Whisper model '{whisper_model}' cached.")
 
+    try:
+        from cli.semantic_search import EMBED_MODEL as _EMBED_MODEL
+        import os as _os
+
+        typer.echo(f"Pre-fetching embedding model '{_EMBED_MODEL}' for semantic search ...")
+        _os.environ.pop("HF_HUB_OFFLINE", None)  # setup is the one network-permitted step
+        from fastembed import TextEmbedding
+
+        TextEmbedding(model_name=_EMBED_MODEL)
+        typer.echo("Embedding model cached.")
+    except ImportError:
+        typer.echo("fastembed not installed -- semantic search stays disabled (optional).")
+
     typer.echo("Done. You may disconnect from the network for all other commands.")
 
 
@@ -584,6 +597,25 @@ def export(
     except ExportError as exc:
         typer.echo(f"Export failed: {exc}", err=True)
         raise typer.Exit(code=1)
+
+
+@app.command()
+def index(
+    settings_path: Path = typer.Option(DEFAULT_SETTINGS_PATH),
+) -> None:
+    """(Re)build the local semantic-search index over reviewed sessions.
+
+    Local-only: embeddings run on CPU from the model cached by `setup`;
+    the index (data/semantic_index.db) is derived data, safe to delete.
+    """
+    from cli.semantic_search import refresh_index
+
+    settings = load_settings(settings_path)
+    meetings_dir = Path(settings.paths.data_dir) / "meetings"
+    state_dir = Path(settings.paths.data_dir) / "state"
+    db_path = Path(settings.paths.data_dir) / "semantic_index.db"
+    stats = refresh_index(meetings_dir, state_dir, db_path)
+    typer.echo(f"Semantic index updated: {stats}")
 
 
 @app.command(name="reap-stale")
