@@ -22,6 +22,8 @@ from pathlib import Path
 
 from cli.capability import CapabilityToken, require_capability_token
 from cli.git_backup import commit_all, ensure_repo
+from concurrency.atomic import atomic_write_text
+from concurrency.lock import FileLock
 from mcp_server import state as state_mod
 from mcp_server.schemas import validate_session_id
 from mcp_server.todo import TodoFile, TodoItem, TodoFileUnparsableError, format_todo_file, parse_todo
@@ -35,6 +37,7 @@ class ReviewDecision:
     owner: str | None
     due_date: str | None
     session_id: str | None
+    priority: str | None = None
 
 
 def load_pending_items(pending_review_path: Path | str) -> list[TodoItem]:
@@ -56,17 +59,18 @@ def write_reviewed_decisions(reviewed_path: Path | str, decisions: list[ReviewDe
         {
             "id": d.id, "decision": d.decision, "description": d.description,
             "owner": d.owner, "due_date": d.due_date, "session_id": d.session_id,
+            "priority": d.priority,
         }
         for d in decisions
     ]
-    reviewed_path.write_text(json.dumps(payload, indent=2))
+    atomic_write_text(reviewed_path, json.dumps(payload, indent=2))
 
 
 def load_reviewed_decisions(reviewed_path: Path | str) -> list[ReviewDecision]:
     reviewed_path = Path(reviewed_path)
     if not reviewed_path.exists():
         raise FileNotFoundError(f"No reviewed-decisions file found at {reviewed_path}.")
-    raw = json.loads(reviewed_path.read_text())
+    raw = json.loads(reviewed_path.read_text(encoding="utf-8"))
     return [ReviewDecision(**entry) for entry in raw]
 
 
@@ -165,7 +169,16 @@ def apply_reviewed_update(
         )
         raise
 
-    existing_by_id = {item.id: item for item in existing.items if item.id is not None}
+    # Soft-deleted items (status="deleted", see update_task_status) are excluded
+    # from the conflict check: a deleted record's id must not permanently block
+    # a future item that happens to reuse it (vanishingly rare with fresh uuid4
+    # ids, but correct behaviour matters more than the odds). The deleted row
+    # itself is untouched -- this only changes what counts as "already present"
+    # for PARTIAL_APPLY_CONFLICT purposes.
+    existing_by_id = {
+        item.id: item for item in existing.items
+        if item.id is not None and item.status != "deleted"
+    }
 
     applied: list[TodoItem] = []
     conflicts: list[dict] = []
@@ -186,12 +199,12 @@ def apply_reviewed_update(
             TodoItem(
                 description=decision.description, done=False, id=decision.id,
                 owner=decision.owner, due_date=decision.due_date, session_id=decision.session_id,
+                priority=decision.priority, status="todo", source=decision.session_id,
             )
         )
 
     merged = TodoFile(items=existing.items + applied)
-    todo_path.parent.mkdir(parents=True, exist_ok=True)
-    todo_path.write_text(format_todo_file(merged))
+    atomic_write_text(todo_path, format_todo_file(merged))
 
     post_hash = commit_all(data_dir, f"post-apply: session '{session_id}' ({len(applied)} item(s))")
 
@@ -217,8 +230,98 @@ def apply_reviewed_update(
     }
 
 
+def write_manual_task(
+    token: CapabilityToken,
+    task_data: dict,
+    todo_path: Path | str,
+    lock_path: Path | str,
+    lock_timeout: float,
+) -> str:
+    """Append a user-created manual task to todo.md (architecture_v2.md §Phase 7.2).
+
+    Gated by `token` the same way `apply_reviewed_update` is -- this is the
+    second function permitted to write data/todo.md, both living in cli/
+    (never mcp_server/) per the capability-token invariant.
+
+    Args:
+        token: A genuine CapabilityToken from cli.capability.mint_capability_token().
+        task_data: dict with "description" (required) and optional
+            "due_date"/"priority"/"tag"/"progress_note".
+        todo_path: Path to data/todo.md.
+        lock_path: Concurrency lock path.
+        lock_timeout: Lock acquisition timeout in seconds.
+
+    Returns:
+        The freshly-minted task id.
+    """
+    require_capability_token(token)
+    from uuid import uuid4
+
+    todo_path = Path(todo_path)
+    task_id = uuid4().hex[:8]
+    item = TodoItem(
+        description=task_data["description"],
+        done=False,
+        id=task_id,
+        owner=None,
+        due_date=task_data.get("due_date"),
+        session_id=None,
+        priority=task_data.get("priority") or "MEDIUM",
+        status="todo",
+        source="manual",
+        progress_note=task_data.get("progress_note"),
+        tag=task_data.get("tag"),
+    )
+
+    with FileLock(lock_path, timeout_seconds=lock_timeout):
+        existing = parse_todo(todo_path)
+        merged = TodoFile(items=existing.items + [item])
+        atomic_write_text(todo_path, format_todo_file(merged))
+
+    return task_id
+
+
+def update_task_status(
+    token: CapabilityToken,
+    task_id: str,
+    updates: dict,
+    todo_path: Path | str,
+    lock_path: Path | str,
+    lock_timeout: float,
+) -> TodoItem:
+    """Update a subset of fields (status/due_date/progress_note/priority) on
+    an existing todo.md item by id, or mark it deleted (soft delete -- the
+    record stays in the file with status="deleted", per architecture_v2.md
+    §Phase 7.2's DELETE endpoint spec). Same CapabilityToken gating as
+    write_manual_task/apply_reviewed_update.
+
+    Raises:
+        KeyError: if no item with `task_id` exists.
+    """
+    require_capability_token(token)
+
+    with FileLock(lock_path, timeout_seconds=lock_timeout):
+        todo_path = Path(todo_path)
+        existing = parse_todo(todo_path)
+        target = next((item for item in existing.items if item.id == task_id), None)
+        if target is None:
+            raise KeyError(f"No task with id '{task_id}' found in {todo_path}.")
+
+        for field in ("status", "due_date", "progress_note", "priority"):
+            if field in updates and updates[field] is not None:
+                setattr(target, field, updates[field])
+        if updates.get("status") == "done":
+            target.done = True
+        elif "status" in updates and updates["status"] is not None:
+            target.done = False
+
+        atomic_write_text(todo_path, format_todo_file(existing))
+        return target
+
+
 def _item_to_dict(item: TodoItem) -> dict:
     return {
         "id": item.id, "description": item.description, "done": item.done,
         "owner": item.owner, "due_date": item.due_date, "session_id": item.session_id,
+        "priority": item.priority, "status": item.status,
     }

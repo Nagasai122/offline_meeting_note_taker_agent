@@ -608,7 +608,7 @@ def import_transcript(
         state_dir, session_id, lock_path, lock_timeout, initial_state=state_mod.State.STOPPED,
         meeting_type=meeting_type, source="import", whisper_model=model_used,
     )
-    type_file_path(meetings_dir, session_id).write_text(meeting_type)
+    type_file_path(meetings_dir, session_id).write_text(meeting_type, encoding="utf-8")
 
     segments = parse_transcript_file(file)
     result = TranscriptionResult(

@@ -4,7 +4,7 @@ only a draft under data/pending_review/, never data/todo.md itself, per the
 draft-only-supervision constraint) plus three read-only query tools:
 get_session_status, list_sessions, get_transcript.
 
-`apply_reviewed_update`, which is the only thing permitted to write
+The reviewed-update applier (cli/review_apply.py), which is the only thing permitted to write
 data/todo.md, deliberately does NOT live in this module or anywhere imported
 by mcp_server/server.py -- per critique amendment 2, it is implemented and
 wired in M6 as a CLI-only command gated by a local capability token, and is
@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
+from concurrency.atomic import atomic_write_text
 from mcp_server import state as state_mod
 from mcp_server.schemas import validate_session_id
 from mcp_server.todo import TodoFileUnparsableError, parse_todo
@@ -50,7 +51,7 @@ def propose_todo_update(
         )
         raise
 
-    action_items = json.loads(actions_path.read_text())
+    action_items = json.loads(actions_path.read_text(encoding="utf-8"))
 
     lines = [f"# Proposed todo updates -- session {session_id}", ""]
     for item in action_items:
@@ -59,12 +60,14 @@ def propose_todo_update(
             "owner": item.get("owner"),
             "due_date": item.get("due_date"),
             "session_id": session_id,
+            "priority": item.get("priority"),
+            "status": "todo",
+            "source": session_id,
         }
         lines.append(f"- [ ] {item['description']} <!-- meta: {json.dumps(meta)} -->")
 
     pending_review_path = Path(pending_review_dir) / f"{session_id}.md"
-    pending_review_path.parent.mkdir(parents=True, exist_ok=True)
-    pending_review_path.write_text("\n".join(lines) + "\n")
+    atomic_write_text(pending_review_path, "\n".join(lines) + "\n")
 
     session = state_mod.transition(
         state_dir, session_id, state_mod.State.PROPOSED, lock_path, lock_timeout,
@@ -99,4 +102,4 @@ def get_transcript(session_id: str, meetings_dir: Path | str) -> dict:
     transcript_path = Path(meetings_dir) / f"{session_id}.json"
     if not transcript_path.exists():
         raise FileNotFoundError(f"No transcript found for session '{session_id}' at {transcript_path}.")
-    return json.loads(transcript_path.read_text())
+    return json.loads(transcript_path.read_text(encoding="utf-8"))

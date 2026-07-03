@@ -16,12 +16,16 @@ original scope of todo.md/projects writes.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
+from concurrency.atomic import atomic_write_text
 from concurrency.lock import FileLock
+
+logger = logging.getLogger(__name__)
 
 
 class State(str, Enum):
@@ -73,14 +77,13 @@ def _now() -> str:
 
 
 def _write(path: Path, session: SessionState) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "session_id": session.session_id,
         "state": session.state.value,
         "history": session.history,
         "metadata": session.metadata,
     }
-    path.write_text(json.dumps(payload, indent=2))
+    atomic_write_text(path, json.dumps(payload, indent=2))
 
 
 def create_session(
@@ -109,7 +112,7 @@ def load_session_state(state_dir: Path | str, session_id: str) -> SessionState:
     path = _state_path(state_dir, session_id)
     if not path.exists():
         raise FileNotFoundError(f"No session state found for '{session_id}' at {path}.")
-    raw = json.loads(path.read_text())
+    raw = json.loads(path.read_text(encoding="utf-8"))
     return SessionState(
         session_id=raw["session_id"],
         state=State(raw["state"]),
@@ -141,6 +144,33 @@ def transition(
     return session
 
 
+def update_metadata(
+    state_dir: Path | str,
+    session_id: str,
+    lock_path: Path | str,
+    lock_timeout: float,
+    **metadata_updates: object,
+) -> SessionState:
+    """Merge `metadata_updates` into a session's metadata without changing its
+    state or appending a history entry.
+
+    Exists for best-effort enrichment steps (calendar/mail/doc-context
+    matching) that need to attach metadata to a session that is not itself a
+    state-machine transition -- `transition()` requires `new_state` to be a
+    genuinely allowed edge from the current state, so a same-state metadata
+    update would otherwise need to (incorrectly) claim a real transition just
+    to get metadata written. This is the one other controlled write path onto
+    a session's state file, still taken under the same FileLock as
+    `transition()` -- per the "state writes only through mcp_server.state"
+    invariant, this is not a bypass of it, it's part of it.
+    """
+    with FileLock(lock_path, timeout_seconds=lock_timeout):
+        session = load_session_state(state_dir, session_id)
+        session.metadata.update(metadata_updates)
+        _write(_state_path(state_dir, session_id), session)
+    return session
+
+
 def list_session_ids(state_dir: Path | str) -> list[str]:
     state_dir = Path(state_dir)
     if not state_dir.exists():
@@ -149,9 +179,12 @@ def list_session_ids(state_dir: Path | str) -> list[str]:
 
 
 def _pid_is_alive(pid: int) -> bool:
-    # Mirrors concurrency.lock._pid_is_alive -- duplicated rather than
-    # imported to keep this module's only dependency on concurrency.lock
-    # being FileLock itself, not an internal helper.
+    # Used only by reap_orphaned_recordings below, to decide whether a session
+    # stuck in RECORDING belongs to a process that has actually died -- this
+    # is unrelated to lock staleness now (concurrency.lock's FileLock is
+    # portalocker-backed and has no PID-file staleness heuristic of its own
+    # to duplicate; a crashed lock-holder's OS-level lock is released
+    # automatically when its handle closes, no PID check needed there).
     try:
         import psutil
         return psutil.pid_exists(pid)
@@ -194,15 +227,27 @@ def reap_orphaned_recordings(
         pid = session.metadata.get("pid")
         if pid is None or _pid_is_alive(int(pid)):
             continue
-        transition(
-            state_dir, session_id, State.FAILED, lock_path, lock_timeout,
-            error="ORPHANED_RECORDING",
-            error_detail=(
-                f"Session was left in RECORDING by pid={pid}, which is no "
-                "longer running (crash, kill, or unclean shutdown). Reaped "
-                "automatically; the partial audio under tmp/, if any, is "
-                "left in place for manual recovery -- see docs/runbook.md."
-            ),
-        )
+        try:
+            transition(
+                state_dir, session_id, State.FAILED, lock_path, lock_timeout,
+                error="ORPHANED_RECORDING",
+                error_detail=(
+                    f"Session was left in RECORDING by pid={pid}, which is no "
+                    "longer running (crash, kill, or unclean shutdown). Reaped "
+                    "automatically; the partial audio under tmp/, if any, is "
+                    "left in place for manual recovery -- see docs/runbook.md."
+                ),
+            )
+        except InvalidTransitionError:
+            # Benign race: the session legitimately finished (RECORDING -> STOPPED)
+            # between our read of its state above and this transition() call --
+            # not a bug, just means the reaper's snapshot was one step stale.
+            # transition() itself is still the sole authority on what's allowed;
+            # this is just declining to treat its rejection as reaper failure.
+            logger.debug(
+                "Session %s finished legitimately before the reaper could mark "
+                "it FAILED; skipping.", session_id,
+            )
+            continue
         reaped.append(session_id)
     return reaped

@@ -73,7 +73,7 @@ def _render_system_prompt(tools: list[dict]) -> str:
     # .format() would misinterpret as placeholders (this broke on first test
     # run -- KeyError: '"thought"' -- a genuine bug, not the file-sync
     # anomaly, caught immediately by the test suite as intended).
-    return _PROMPT_PATH.read_text().replace("__TOOL_CATALOGUE__", _render_tool_catalogue(tools))
+    return _PROMPT_PATH.read_text(encoding="utf-8").replace("__TOOL_CATALOGUE__", _render_tool_catalogue(tools))
 
 
 def _render_turn(session_id: str, transcript: list[str]) -> str:
@@ -89,11 +89,20 @@ class AgentLoop:
         mcp_client: AgentMCPClient,
         trace_dir: Path | str,
         max_iterations: int = 12,
+        filter_tools: frozenset[str] | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.mcp_client = mcp_client
         self.trace_dir = trace_dir
         self.max_iterations = max_iterations
+        # Fix 1.3: tools to hide from the agent's tool catalogue. When the
+        # pipeline orchestrator (cli/web.py run_pipeline) already performed
+        # transcription before launching the agent, it passes
+        # frozenset({"transcribe_meeting"}) so the agent never sees that tool
+        # and cannot accidentally call it (defence-in-depth beyond the state
+        # guard in mcp_server/tools/transcription.py and the system-prompt
+        # dispatch table).
+        self.filter_tools: frozenset[str] = filter_tools or frozenset()
 
     async def run(self, session_id: str) -> AgentRunResult:
         run_id = session_id + "-" + uuid.uuid4().hex[:8]
@@ -102,6 +111,8 @@ class AgentLoop:
         trace.start(goal, session_id)
 
         tools = await self.mcp_client.list_tools()
+        if self.filter_tools:
+            tools = [t for t in tools if t["name"] not in self.filter_tools]
         tool_names = {t["name"] for t in tools}
         system_prompt = _render_system_prompt(tools)
         transcript: list[str] = []

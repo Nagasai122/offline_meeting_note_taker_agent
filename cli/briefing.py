@@ -58,7 +58,11 @@ def bucket_open_tasks(todo_path: Path | str, today: date) -> TaskBuckets:
     todo = parse_todo(todo_path)
     week_cutoff = today + timedelta(days=6)
     for item in todo.items:
-        if item.done:
+        # "deleted" is a soft-delete status (architecture_v2.md §Phase 7.2's
+        # DELETE endpoint) -- the record stays in todo.md for history/audit,
+        # but must not appear in "what is left to do" the same way a
+        # done=True item doesn't.
+        if item.done or item.status == "deleted":
             continue
         if item.due_date is None:
             buckets.no_date.append(item)
@@ -89,9 +93,16 @@ def pipeline_status(state_dir: Path | str, today: date) -> dict:
     awaiting_apply: list[str] = []
     failed_today: list[str] = []
     applied_today: list[str] = []
+    unreadable: list[str] = []
 
     for session_id in state_mod.list_session_ids(state_dir):
-        session = state_mod.load_session_state(state_dir, session_id)
+        try:
+            session = state_mod.load_session_state(state_dir, session_id)
+        except (ValueError, KeyError, FileNotFoundError):
+            # One corrupted state file (crash mid-write, hand edit) must not
+            # take down the whole morning briefing; surface it instead.
+            unreadable.append(session_id)
+            continue
         if session.state == state_mod.State.PROPOSED:
             awaiting_review.append(session_id)
         elif session.state == state_mod.State.REVIEWED:
@@ -116,6 +127,7 @@ def pipeline_status(state_dir: Path | str, today: date) -> dict:
         "awaiting_apply": sorted(awaiting_apply),
         "failed_today": sorted(failed_today),
         "applied_today": sorted(applied_today),
+        "unreadable": sorted(unreadable),
     }
 
 
@@ -150,7 +162,7 @@ def build_daily_briefing(
         for summary_file in summary_files:
             try:
                 session_id = summary_file.name.replace(".summary.md", "")
-                content = summary_file.read_text()
+                content = summary_file.read_text(encoding="utf-8")
                 notes.append({
                     "session_id": session_id,
                     "content": content
@@ -211,5 +223,9 @@ def render_briefing(briefing: dict) -> str:
     lines.append(f"  Awaiting apply (REVIEWED): {', '.join(sessions['awaiting_apply']) or 'none'}")
     lines.append(f"  Failed today -- needs attention: {', '.join(sessions['failed_today']) or 'none'}")
     lines.append(f"  Applied today: {', '.join(sessions['applied_today']) or 'none'}")
+    if sessions.get("unreadable"):
+        lines.append(
+            f"  Unreadable state files -- inspect by hand: {', '.join(sessions['unreadable'])}"
+        )
 
     return "\n".join(lines)

@@ -6,8 +6,15 @@ reviews and may hand-edit this file directly, per the draft-only-supervision
 constraint):
 
     - [ ] Buy projector bulb <!-- meta: {"id": "a1b2c3", "owner": null,
-      "due_date": "2026-07-04", "session_id": "standup-2026-06-30"} -->
+      "due_date": "2026-07-04", "session_id": "standup-2026-06-30",
+      "priority": "MEDIUM", "status": "todo", "source": "standup-2026-06-30",
+      "progress_note": null, "tag": null} -->
     - [x] Send agenda <!-- meta: {"id": "f9e8d7"} -->
+
+`priority`/`status`/`source`/`progress_note`/`tag` were added for meeting-type-
+aware extraction and manual task tracking (architecture_v2.md). An item whose
+meta JSON predates these fields parses with `status="todo"` and
+`source="legacy"` -- see `parse_todo` -- never a KeyError.
 
 Per critique amendment 8, a malformed line (bad checklist marker, or an
 unparsable JSON `meta` comment) must surface as a typed `TodoFileUnparsableError`
@@ -43,6 +50,16 @@ class TodoItem:
     owner: str | None = None
     due_date: str | None = None
     session_id: str | None = None
+    # Added for meeting-type-aware extraction (priority) and manual task
+    # tracking (status/source/progress_note/tag). All optional and absent from
+    # older todo.md entries parse to their defaults below -- no migration step
+    # is needed, per parse_todo's existing meta.get(...) degrade-gracefully
+    # design.
+    priority: str | None = None
+    status: str = "todo"
+    source: str | None = None
+    progress_note: str | None = None
+    tag: str | None = None
 
 
 @dataclass
@@ -56,7 +73,7 @@ def parse_todo(path: Path | str) -> TodoFile:
         return TodoFile(items=[])  # first run: no todo.md yet is not an error
 
     items: list[TodoItem] = []
-    for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         stripped = line.strip()
         if not stripped:
             continue
@@ -92,6 +109,15 @@ def parse_todo(path: Path | str) -> TodoFile:
                 owner=meta.get("owner"),
                 due_date=meta.get("due_date"),
                 session_id=meta.get("session_id"),
+                priority=meta.get("priority"),
+                status=meta.get("status", "todo"),
+                # An item written before this field existed has no "source" key
+                # at all (not just a null value) -- that absence is exactly what
+                # "legacy" is meant to flag, per architecture_v2.md's todo.md
+                # extension notes.
+                source=meta.get("source", "legacy"),
+                progress_note=meta.get("progress_note"),
+                tag=meta.get("tag"),
             )
         )
     return TodoFile(items=items)
@@ -99,7 +125,17 @@ def parse_todo(path: Path | str) -> TodoFile:
 
 def format_item(item: TodoItem) -> str:
     mark = "x" if item.done else " "
-    meta = {"id": item.id, "owner": item.owner, "due_date": item.due_date, "session_id": item.session_id}
+    meta = {
+        "id": item.id,
+        "owner": item.owner,
+        "due_date": item.due_date,
+        "session_id": item.session_id,
+        "priority": item.priority,
+        "status": item.status,
+        "source": item.source,
+        "progress_note": item.progress_note,
+        "tag": item.tag,
+    }
     meta_json = json.dumps(meta)
     return f"- [{mark}] {item.description} <!-- meta: {meta_json} -->"
 
@@ -110,8 +146,8 @@ def format_todo_file(file: TodoFile) -> str:
     Known, deliberately-flagged limitation: `parse_todo` above only retains
     checklist lines -- any heading or free-text commentary a human has added
     to `todo.md` by hand is silently skipped during parsing, and is therefore
-    NOT round-tripped by a parse_todo -> format_todo_file cycle. apply_reviewed_update
-    (M6) is the only caller of this function, and it is acceptable for that
+    NOT round-tripped by a parse_todo -> format_todo_file cycle. The reviewed-update
+    applier in cli/review_apply.py (M6) is the only caller of this function, and it is acceptable for that
     narrow use because it always reads the file immediately before writing it
     back within the same locked critical section -- but this function must
     not be reused anywhere a human's surrounding prose needs preserving

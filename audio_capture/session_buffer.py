@@ -121,12 +121,12 @@ class SessionBuffer:
         existing: dict = {}
         if self.sidecar_path.exists():
             try:
-                existing = json.loads(self.sidecar_path.read_text())
+                existing = json.loads(self.sidecar_path.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 existing = {}
         existing.update({k: v for k, v in fields.items() if v is not None or k == "error"})
         existing["session_id"] = self.session_id
-        self.sidecar_path.write_text(json.dumps(existing, indent=2))
+        self.sidecar_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
 
 
 def sweep_orphaned_audio(tmp_dir: Path, ttl_seconds: float = 0.0) -> list[Path]:
