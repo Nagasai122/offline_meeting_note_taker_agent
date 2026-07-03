@@ -251,3 +251,76 @@ architecture.md piecemeal mid-audit.
 state-machine table validated with divergences flagged — MET (one item to
 [HUMAN DECISION]); structure reconciled — MET (drift flagged, doc fix
 queued).
+
+---
+
+## Strand C — Functional and stress testing
+
+### Plan (written before execution)
+
+1. Parity suite (`tests/parity/`): CLI in-process path vs web endpoints for
+   review→apply, double-apply refusal, malformed-todo.md failure — assert
+   *identical* semantic outcomes, not merely "both pass their own tests".
+2. Fault-injection suite (`tests/faults/`): malformed transcripts in all 4
+   import formats, corrupted `data/state/` files (incl. the orphan reaper
+   and briefing walking past them), concurrent capability-gated todo.md
+   writers, and the web upload endpoint under garbage input.
+3. Property suite (`tests/property/`, hypothesis): todo.md round-trip
+   losslessness; `_parse_extraction_result` totality (ExtractionError or a
+   contract-satisfying dict — nothing else) over arbitrary text; extraction
+   items surviving the pending-review draft rendering.
+4. Regression coverage confirmed for every Strand A/B fix.
+
+### Findings (2026-07-03)
+
+**C-1 (MEDIUM, fixed): malformed transcript upload was an unhandled 500.**
+`POST /api/upload/transcript`'s try-block had only a `finally:` — a
+truncated/invalid `.json` transcript raised JSONDecodeError/KeyError
+straight through FastAPI. Fixed on two levels: `parse_whisper_json` now
+normalises structural garbage (bad JSON, missing keys, non-numeric times)
+to its *documented* `ValueError` contract, and the endpoint returns 400
+with a parse message. Regression tests: 4 in tests/faults (parser) + 3
+endpoint tests.
+
+**C-2 (HIGH, fixed — found by hypothesis on the first property run):
+Windows encoding corruption on every non-ASCII character.** All artefact
+writers emit UTF-8 (`atomic_write_text(encoding="utf-8")`), but ten
+production read sites used locale-default `Path.read_text()` — on this
+project's own target platform (Windows, cp1252) any non-ASCII character in
+an action item, transcript, summary, or state metadata (a name like "José",
+a "±", an em-dash from an LLM summary) round-trips as mojibake or raises
+UnicodeDecodeError. Falsifying example: description `'¡'` → parsed back as
+`'Â¡'`. Fixed: explicit `encoding="utf-8"` added to all 10 read sites
+(todo.py, state.py, review.py×2, briefing.py, loop.py, review_apply.py,
+web.py×2, session_buffer.py) and 7 locale-default write sites (web.py×5,
+main.py, session_buffer.py). Regression: the hypothesis round-trip test
+itself (200 examples/run) now passes; full suite green.
+
+**C-3 (MEDIUM, fixed): one corrupted state file killed the whole briefing.**
+`pipeline_status` crashed with JSONDecodeError if any `data/state/*.json`
+was truncated/hand-mangled — taking down both `meeting-agent briefing` and
+the dashboard's briefing widget. Now skips unreadable files and surfaces
+them as a new `unreadable` bucket (rendered as "inspect by hand" in the
+text briefing). Regression: `test_briefing_survives_corrupted_state_file`,
+`test_reaper_skips_corrupted_state_files_and_reaps_the_rest` (the reaper
+already handled this correctly — now pinned by test).
+
+**C-4: parity confirmed (acceptance criterion 1).** 3 tests: identical
+todo.md semantic content from CLI and web apply; double-apply refused on
+both paths (InvalidTransitionError / 409) with todo.md untouched;
+malformed todo.md → both paths fail the session with TODO_FILE_UNPARSEABLE,
+neither rewrites the corrupt file (web status pinned at 422).
+
+**C-5: concurrency.** 12 threads racing `write_manual_task` under the
+FileLock: zero lost items, zero torn writes, file stays parsable.
+
+**Strand A/B fix coverage check (acceptance criterion 4):** A-6 (env-var
+isolation) is itself a test; B-1 → tests/cli/test_doc_ingest.py +
+test_mail_sync.py; B-2/B-4 are non-behavioural (ruff/bandit gates would
+re-flag); C-1/C-2/C-3 as above. 100% of behavioural fixes have regression
+tests.
+
+**Test count: 196 → 228 passing (32 added), 0 failing.** `hypothesis`
+added to the dev extra in pyproject.toml.
+
+**Strand C acceptance criteria: all four MET.**
