@@ -37,3 +37,6 @@ tmp/
 *.swp
 .DS_Store
 Thumbs.db
+
+# Property-testing example database (rebuilt on demand)
+.hypothesis/
