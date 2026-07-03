@@ -18,12 +18,21 @@ against two different failure modes: (b) against "the agent loop's model
 decides to call it", (a) against "a future code change wires it up without
 anyone noticing".
 
-`mint_capability_token()` is deliberately called from exactly two places in
+`mint_capability_token()` is deliberately called from exactly six places in
 the trusted CLI surface:
   1. cli/main.py `apply` command — the original call site.
   2. cli/web.py `POST /api/review/apply` endpoint — added when the web
      dashboard gained its own review/apply UI (both callers are in cli/,
      never in agent/ or mcp_server/).
+  3. cli/web.py `run_pipeline`'s auto-accept path — the in-process apply for
+     pipelines started with auto_accept=True, calling the same
+     `apply_reviewed_update()` as the endpoint above.
+  4. cli/web.py `POST /api/tasks/manual` endpoint — mints a token to call
+     `write_manual_task()` (architecture_v2.md §Phase 7.2).
+  5. cli/web.py `PATCH /api/tasks/{task_id}` endpoint — mints a token to call
+     `update_task_status()`.
+  6. cli/web.py `DELETE /api/tasks/{task_id}` endpoint — mints a token to call
+     `update_task_status()` with a status="deleted" soft delete.
 Grep for `mint_capability_token()` call sites is itself a verification step
 (docs/architecture.md should list this as part of the M6 verification
 checklist); this docstring must be kept current whenever a new call site is
