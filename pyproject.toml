@@ -17,11 +17,19 @@ dependencies = [
     "uvicorn>=0.23",
     "nvidia-cublas-cu12; sys_platform == 'win32'",
     "nvidia-cudnn-cu12; sys_platform == 'win32'",
+    "pdfplumber>=0.10",
+    "python-pptx>=0.6",
+    "python-docx>=1.1",
+    "python-multipart>=0.0.9",
+    "rank-bm25>=0.2",
+    "winotify>=1.1; sys_platform == 'win32'",
+    "portalocker>=2.7",
+    "sse-starlette>=1.6",
 ]
 
 [project.optional-dependencies]
 diarisation = ["pyannote.audio>=3.3"]
-dev = ["pytest>=8.0", "pytest-cov>=5.0"]
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "hypothesis>=6.100"]
 
 [project.scripts]
 meeting-agent = "cli.main:app"
@@ -31,4 +39,4 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["agent", "audio_capture", "cli", "concurrency", "config", "llm", "mcp_server", "transcribe"]
+packages = ["agent", "audio_capture", "cli", "concurrency", "config", "llm", "mcp_server", "mcp_server/tools", "transcribe", "scripts"]
