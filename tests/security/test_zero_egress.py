@@ -71,7 +71,8 @@ IMPORT_ALLOWLIST: dict[tuple[str, str], str] = {
     ("llm/http_probe.py", "httpx"): "localhost health probe; AsyncClient(trust_env=False) hard-wired",
     ("llm/server_manager.py", "httpx"): "localhost health check; trust_env=False",
     ("cli/main.py", "huggingface_hub"): "lazy import inside setup() — the one permitted network command",
-    ("cli/web.py", "socket"): "socket.create_connection to 127.0.0.1 only (LLM port probes)",
+    ("cli/web.py", "socket"): "socket.create_connection to 127.0.0.1/settings.llm.host only (LLM port probes)",
+    ("cli/app_launcher.py", "socket"): "127.0.0.1:8000 dashboard-readiness probe only (tray launcher)",
 }
 
 
