@@ -38,6 +38,7 @@ class ReviewDecision:
     due_date: str | None
     session_id: str | None
     priority: str | None = None
+    evidence: str | None = None
 
 
 def load_pending_items(pending_review_path: Path | str) -> list[TodoItem]:
@@ -59,7 +60,7 @@ def write_reviewed_decisions(reviewed_path: Path | str, decisions: list[ReviewDe
         {
             "id": d.id, "decision": d.decision, "description": d.description,
             "owner": d.owner, "due_date": d.due_date, "session_id": d.session_id,
-            "priority": d.priority,
+            "priority": d.priority, "evidence": d.evidence,
         }
         for d in decisions
     ]
@@ -200,6 +201,7 @@ def apply_reviewed_update(
                 description=decision.description, done=False, id=decision.id,
                 owner=decision.owner, due_date=decision.due_date, session_id=decision.session_id,
                 priority=decision.priority, status="todo", source=decision.session_id,
+                evidence=decision.evidence,
             )
         )
 

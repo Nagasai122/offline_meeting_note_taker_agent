@@ -64,6 +64,11 @@ def propose_todo_update(
             "status": "todo",
             "source": session_id,
         }
+        # Provenance quote from the transcript ("why does this task exist") —
+        # optional in the extraction contract; only written when present so
+        # legacy drafts and prompts without it stay byte-identical.
+        if item.get("evidence"):
+            meta["evidence"] = item["evidence"]
         lines.append(f"- [ ] {item['description']} <!-- meta: {json.dumps(meta)} -->")
 
     pending_review_path = Path(pending_review_dir) / f"{session_id}.md"

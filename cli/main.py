@@ -387,13 +387,15 @@ def review(
     decisions: list[ReviewDecision] = []
     for item in items:
         typer.echo(f"  - {item.description}  (owner={item.owner!r}, due={item.due_date!r}, priority={item.priority!r})")
+        if item.evidence:
+            typer.echo(f"      \"{item.evidence}\"")
         accept = typer.confirm("    Accept this item?", default=True)
         if not accept:
             decisions.append(
                 ReviewDecision(
                     id=item.id, decision="reject", description=item.description,
                     owner=item.owner, due_date=item.due_date, session_id=item.session_id,
-                    priority=item.priority,
+                    priority=item.priority, evidence=item.evidence,
                 )
             )
             continue
@@ -409,7 +411,7 @@ def review(
             ReviewDecision(
                 id=item.id, decision="accept", description=description,
                 owner=owner, due_date=due_date, session_id=item.session_id,
-                priority=item.priority,
+                priority=item.priority, evidence=item.evidence,
             )
         )
 

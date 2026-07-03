@@ -60,6 +60,10 @@ class TodoItem:
     source: str | None = None
     progress_note: str | None = None
     tag: str | None = None
+    # Verbatim transcript quote captured at extraction time -- the provenance
+    # answer to "why does this task exist". Optional; absent on manual tasks
+    # and anything extracted before this field existed.
+    evidence: str | None = None
 
 
 @dataclass
@@ -118,6 +122,7 @@ def parse_todo(path: Path | str) -> TodoFile:
                 source=meta.get("source", "legacy"),
                 progress_note=meta.get("progress_note"),
                 tag=meta.get("tag"),
+                evidence=meta.get("evidence"),
             )
         )
     return TodoFile(items=items)
@@ -136,6 +141,8 @@ def format_item(item: TodoItem) -> str:
         "progress_note": item.progress_note,
         "tag": item.tag,
     }
+    if item.evidence:
+        meta["evidence"] = item.evidence
     meta_json = json.dumps(meta)
     return f"- [{mark}] {item.description} <!-- meta: {meta_json} -->"
 

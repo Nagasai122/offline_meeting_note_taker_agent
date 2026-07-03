@@ -1013,7 +1013,7 @@ async def run_pipeline(session_id: str, auto_accept: bool = False, whisper_model
                     ReviewDecision(
                         id=item.id, decision="accept", description=item.description,
                         owner=item.owner, due_date=item.due_date, session_id=item.session_id,
-                        priority=item.priority,
+                        priority=item.priority, evidence=item.evidence,
                     )
                     for item in pending_items
                 ]
@@ -1131,6 +1131,7 @@ async def get_review_pending():
                     "owner": item.owner,
                     "due_date": item.due_date,
                     "priority": item.priority,
+                    "evidence": item.evidence,
                 }
                 for item in items
             ],
@@ -1151,6 +1152,7 @@ class ReviewItemDecision(BaseModel):
     owner: str | None = None
     due_date: str | None = None
     priority: str | None = None
+    evidence: str | None = None
     rejection_reason: str | None = None  # Fix 3.4: optional reason for rejections
 
 
@@ -1192,6 +1194,7 @@ async def post_review_decide(req: ReviewDecideRequest):
             due_date=d.due_date,
             session_id=req.session_id,
             priority=d.priority,
+            evidence=d.evidence,
         )
         for d in req.decisions
     ]
