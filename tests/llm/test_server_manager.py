@@ -11,7 +11,8 @@ machine, all via mocks. Treat this as "the wiring is correct," not "it runs."
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
+from unittest.mock import patch as mock_patch
 
 import pytest
 
@@ -32,7 +33,10 @@ def test_privacy_env_overrides_existing_vars(monkeypatch):
     assert env["DO_NOT_TRACK"] == "1"
 
 
-def test_build_launch_command_llama_server(tmp_path):
+def test_build_launch_command_llama_server(tmp_path, monkeypatch):
+    # A developer machine may point LLAMA_SERVER_EXE at a local build; the
+    # test asserts the *default* executable name, so isolate the env var.
+    monkeypatch.delenv("LLAMA_SERVER_EXE", raising=False)
     profile = PROFILES["nemotron_nvfp4"]
     weights = tmp_path / "model.gguf"
     cmd = _build_launch_command(profile, weights, "127.0.0.1", 8080)
@@ -75,7 +79,7 @@ def test_start_server_raises_on_early_exit(tmp_path):
     mock_process.returncode = 1
     mock_process.stdout.read.return_value = "fatal: out of memory"
 
-    with patch("llm.server_manager.subprocess.Popen", return_value=mock_process):
+    with mock_patch("llm.server_manager.subprocess.Popen", return_value=mock_process):
         with pytest.raises(ServerLaunchError, match="exited early"):
             start_server(
                 profile=profile,
@@ -99,8 +103,8 @@ def test_start_server_succeeds_on_healthy_response(tmp_path):
     mock_response = MagicMock()
     mock_response.status_code = 200
 
-    with patch("llm.server_manager.subprocess.Popen", return_value=mock_process), \
-         patch("llm.server_manager.httpx.get", return_value=mock_response):
+    with mock_patch("llm.server_manager.subprocess.Popen", return_value=mock_process), \
+         mock_patch("llm.server_manager.httpx.get", return_value=mock_response):
         handle = start_server(
             profile=profile,
             models_dir=tmp_path,
