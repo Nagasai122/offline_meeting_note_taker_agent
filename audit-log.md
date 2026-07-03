@@ -474,3 +474,22 @@ hostname today) — single-host mode works with zero code changes.
 MET (F-1/F-2); container egress policy independently enforced — MET
 (internal network + verification steps); healthchecks present for both
 LLM and app/transcription containers — MET.
+
+---
+
+## Strand E — Feature proposal (design only)
+
+Delivered: `docs/feature-proposal-2026-07.md`. All five candidates
+specified (problem/approach/effort/zero-egress statement/token
+interaction): semantic search+chat (sqlite-vec over chromadb, telemetry
+grounds), seminar diarisation UX (plumbing exists; setup prefetch + UI
+toggle + label renaming), local Zotero cross-reference (read-only sqlite,
+opt-in), Obsidian export (cheapest high-value; first write outside data/
+— constraints stated), weekly-digest assessment (adequate; extend with
+week-over-week trends + state-based session filter — the mtime-based
+filter is arguably a small correctness bug today). All five confirmed
+zero-egress compatible; none touches the agent write scope or weakens the
+token gate. Prioritisation table included for the [HUMAN DECISION]
+go/no-go. No code written under this strand.
+
+**Strand E acceptance criteria: both MET.**
