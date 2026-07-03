@@ -1668,6 +1668,7 @@ async def get_settings():
 
 class SettingsPatchRequest(BaseModel):
     whisper_model: str | None = None
+    diarisation_enabled: bool | None = None
 
 
 @app.patch("/api/settings")
@@ -1677,21 +1678,30 @@ async def patch_settings(req: SettingsPatchRequest):
     tomllib-parse + re-serialise round trip, since Python's stdlib TOML
     support is read-only and a full rewrite would silently drop comments in
     a file the user may hand-edit -- see architecture_v2.md deviation notes."""
-    if req.whisper_model is None:
+    if req.whisper_model is None and req.diarisation_enabled is None:
         return JSONResponse({"status": "no_changes"})
 
-    valid_models = {"base", "small", "large-v3"}
-    if req.whisper_model not in valid_models:
-        return JSONResponse({"error": f"whisper_model must be one of {sorted(valid_models)}"}, status_code=422)
-
     text = DEFAULT_SETTINGS_PATH.read_text(encoding="utf-8")
-    new_text, count = re.subn(
-        r'(\[whisper\][^\[]*?\bmodel\s*=\s*)"[^"]*"',
-        lambda m: f'{m.group(1)}"{req.whisper_model}"',
-        text, count=1, flags=re.DOTALL,
-    )
-    if count == 0:
-        return JSONResponse({"error": "Could not locate [whisper].model in settings.toml"}, status_code=500)
+    new_text = text
+    if req.whisper_model is not None:
+        valid_models = {"base", "small", "medium", "large-v3", "distil-large-v3"}
+        if req.whisper_model not in valid_models:
+            return JSONResponse({"error": f"whisper_model must be one of {sorted(valid_models)}"}, status_code=422)
+        new_text, count = re.subn(
+            r'(\[whisper\][^\[]*?\bmodel\s*=\s*)"[^"]*"',
+            lambda m: f'{m.group(1)}"{req.whisper_model}"',
+            new_text, count=1, flags=re.DOTALL,
+        )
+        if count == 0:
+            return JSONResponse({"error": "Could not locate [whisper].model in settings.toml"}, status_code=500)
+    if req.diarisation_enabled is not None:
+        new_text, count = re.subn(
+            r'(\[whisper\][^\[]*?\bdiarisation_enabled\s*=\s*)(true|false)',
+            lambda m: f'{m.group(1)}{str(req.diarisation_enabled).lower()}',
+            new_text, count=1, flags=re.DOTALL,
+        )
+        if count == 0:
+            return JSONResponse({"error": "Could not locate [whisper].diarisation_enabled in settings.toml"}, status_code=500)
 
     tmp_path = DEFAULT_SETTINGS_PATH.with_suffix(".toml.tmp")
     tmp_path.write_text(new_text, encoding="utf-8")
@@ -1699,7 +1709,11 @@ async def patch_settings(req: SettingsPatchRequest):
 
     global settings
     settings = load_settings(DEFAULT_SETTINGS_PATH)
-    return JSONResponse({"status": "saved", "whisper_model": settings.whisper.model})
+    return JSONResponse({
+        "status": "saved",
+        "whisper_model": settings.whisper.model,
+        "diarisation_enabled": settings.whisper.diarisation_enabled,
+    })
 
 
 # ── Manual task entry / status tracking (architecture_v2.md §Phase 7.2) ─────────

@@ -4,10 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Meeting Agent Dashboard</title>
-    <!-- Google Fonts: Fraunces (display serif, headings), Karla (body), JetBrains Mono (session IDs/timestamps/data) -->
-    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Karla:wght@400;500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-    <!-- FontAwesome for Icons -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Zero-egress: all fonts are local system faces (Segoe UI Variable /
+         Cascadia), and Font Awesome is vendored under /static/vendor/.
+         This page makes no network requests. -->
+    <link rel="stylesheet" href="/static/vendor/fontawesome/css/all.min.css">
     <link rel="stylesheet" href="/static/index.css">
 </head>
 <body>
@@ -438,15 +438,23 @@
                         </p>
                         <div class="radio-group" id="whisper-model-radios">
                             <label class="radio-option">
-                                <input type="radio" name="whisper-model" value="base"> Fast (base) — ~10× real-time, ~8% WER
+                                <input type="radio" name="whisper-model" value="base"> Fast (base) — fastest, weakest on technical vocabulary
                             </label>
                             <label class="radio-option">
-                                <input type="radio" name="whisper-model" value="small"> Balanced (small) — ~6× real-time, ~5% WER
+                                <input type="radio" name="whisper-model" value="medium"> Balanced (medium)
                             </label>
                             <label class="radio-option">
-                                <input type="radio" name="whisper-model" value="large-v3"> Accurate (large-v3) — ~2× real-time, ~2.5% WER
+                                <input type="radio" name="whisper-model" value="distil-large-v3" checked> Recommended (distil-large-v3) — near-large-v3 accuracy, measured 43× realtime on this GPU
+                            </label>
+                            <label class="radio-option">
+                                <input type="radio" name="whisper-model" value="large-v3"> Maximum accuracy (large-v3)
                             </label>
                         </div>
+                        <label class="radio-option" style="margin-top: 1rem;">
+                            <input type="checkbox" id="diarisation-toggle">
+                            Speaker diarisation (best-effort; needs the optional pyannote extra —
+                            labels multi-speaker seminars as SPEAKER_00/01/…)
+                        </label>
                         <button class="btn-primary" style="margin-top: 1rem;" onclick="saveSettings()">Save</button>
                         <span id="settings-save-status" style="margin-left: 1rem; font-size: 0.85rem; color: var(--text-muted);"></span>
                     </div>
@@ -525,7 +533,14 @@
             <button onclick="closeMeetingDetail()" aria-label="Close"
                     style="position:absolute;top:1rem;right:1rem;background:none;border:none;
                            color:var(--text-muted);font-size:1.4rem;cursor:pointer;">&#x2715;</button>
-            <h2 id="modal-session-title" style="color:var(--primary);margin-bottom:1rem;"></h2>
+            <h2 id="modal-session-title" style="color:var(--primary);margin-bottom:0.5rem;"></h2>
+            <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:1rem;">
+                <button class="btn-secondary" style="padding:5px 14px;font-size:0.8rem;"
+                        onclick="exportCurrentSessionToVault()">
+                    <i class="fa-solid fa-file-export"></i> Export to vault
+                </button>
+                <span id="modal-export-status" style="font-size:0.78rem;color:var(--text-muted);"></span>
+            </div>
 
             <div id="modal-calendar-link" style="display:none;margin-bottom:1rem;font-size:0.85rem;color:var(--pine-deep);"></div>
 

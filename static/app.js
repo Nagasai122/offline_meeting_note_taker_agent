@@ -880,6 +880,7 @@ function renderReviewItem(sessionId, item) {
             <div style="display:flex;align-items:flex-start;gap:0.75rem;">
                 <div style="flex:1;">
                     <div style="font-weight:500;margin-bottom:0.4rem;">${safeDesc}</div>
+                    ${item.evidence ? `<div class="evidence-quote">“${escHtml(item.evidence)}”</div>` : ''}
                     <div style="display:flex;gap:0.75rem;flex-wrap:wrap;">
                         <label style="font-size:0.8rem;color:var(--text-muted);">Owner:
                             <input type="text" value="${safeOwner}"
@@ -1076,6 +1077,7 @@ async function openMeetingDetail(sessionId) {
     if (!modal) return;
 
     document.getElementById('modal-session-title').textContent = sessionId;
+    window._currentDetailSession = sessionId;
     ['modal-calendar-link','modal-mom','modal-summary','modal-actions','modal-highlights','modal-transcript'].forEach(id => {
         document.getElementById(id).style.display = 'none';
     });
@@ -1495,6 +1497,8 @@ async function loadSettings() {
         const data = await resp.json();
         const radios = document.querySelectorAll('#whisper-model-radios input[type="radio"]');
         radios.forEach(r => { r.checked = (r.value === data.whisper_model); });
+        const diar = document.getElementById('diarisation-toggle');
+        if (diar) diar.checked = !!data.diarisation_enabled;
     } catch (e) {
         console.error('loadSettings:', e);
     }
@@ -1509,7 +1513,10 @@ async function saveSettings() {
         const resp = await fetch('/api/settings', {
             method: 'PATCH',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ whisper_model: checked.value }),
+            body: JSON.stringify({
+                whisper_model: checked.value,
+                diarisation_enabled: !!(document.getElementById('diarisation-toggle') || {}).checked,
+            }),
         });
         const data = await resp.json();
         if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
@@ -1622,6 +1629,9 @@ function renderFullTaskList(allTasks) {
                     <span><i class="fa-solid fa-user"></i> ${escHtml(t.owner) || 'Unassigned'}</span>
                     <span><i class="fa-solid fa-calendar"></i> ${escHtml(t.due_date) || 'No date'}</span>
                     ${t.tag ? `<span><i class="fa-solid fa-tag"></i> ${escHtml(t.tag)}</span>` : ''}
+                    ${t.session_id ? `<a class="session-link" title="Open the meeting this task came from"
+                            onclick="event.stopPropagation(); openMeetingDetail('${escHtml(t.session_id)}')">
+                            <i class="fa-solid fa-link"></i> ${escHtml(t.session_id)}</a>` : ''}
                     <button class="btn-icon" style="width:22px;height:22px;" title="Edit progress note"
                             onclick="event.stopPropagation(); _toggleNoteEditor('${escHtml(t.id)}')">
                         <i class="fa-solid fa-pencil" style="font-size:0.7rem;"></i>
@@ -1634,6 +1644,7 @@ function renderFullTaskList(allTasks) {
                            onblur="_saveProgressNote('${escHtml(t.id)}', this.value)">
                 </div>
                 ${t.progress_note ? `<div style="font-size:0.8rem;color:var(--text-muted);margin-top:0.3rem;"><i class="fa-solid fa-note-sticky"></i> ${escHtml(t.progress_note)}</div>` : ''}
+                ${t.evidence ? `<div class="evidence-quote">“${escHtml(t.evidence)}”</div>` : ''}
             </div>
             <select class="status-select" onclick="event.stopPropagation();" onchange="event.stopPropagation(); _updateTaskStatus('${escHtml(t.id)}', this.value)">
                 <option value="todo" ${status === 'todo' ? 'selected' : ''}>To Do</option>
@@ -1761,5 +1772,25 @@ async function submitTranscriptImport() {
         errorEl.textContent = `Import failed: ${e.message}`;
     } finally {
         btn.disabled = false;
+    }
+}
+
+
+async function exportCurrentSessionToVault() {
+    const statusEl = document.getElementById('modal-export-status');
+    const sessionId = window._currentDetailSession;
+    if (!sessionId) return;
+    statusEl.textContent = 'Exporting…';
+    try {
+        const resp = await fetch('/api/export/vault', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ session_id: sessionId }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        statusEl.textContent = 'Exported to ' + data.paths[0];
+    } catch (e) {
+        statusEl.textContent = 'Export failed: ' + e.message;
     }
 }
