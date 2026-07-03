@@ -147,3 +147,107 @@ with `monkeypatch.delenv`. (Unambiguous test-hygiene fix, executed.)
 
 **Strand A acceptance criteria:** all three MET. No [HUMAN DECISION] stop
 condition reached (no actual egress path, no token bypass).
+
+---
+
+## Strand B — Code-quality audit
+
+### Plan (written before execution)
+
+1. Exclusion list from docs/code_review_2026_07_01.md (see header) — fresh
+   findings only.
+2. ruff / mypy / bandit across all nine production packages; triage; fix
+   unambiguous defects (with regression tests); record the rest as baseline.
+3. State-machine review: ALLOWED_TRANSITIONS vs docs/architecture.md graph,
+   import-transcript's alternate entry, orphan states.
+4. Directory-structure drift vs the canonical tree in docs/architecture.md.
+
+### Findings (2026-07-03)
+
+**Static-analysis baseline (tool versions: ruff 0.15.20, mypy 2.1.0,
+bandit latest; all newly added to the dev environment — none were installed
+or configured before this audit):**
+
+**B-1 (HIGH, fixed): two real runtime crashes from missing imports.**
+`cli/doc_ingest.py::ingest_document` and `cli/mail_sync.py::save_mail_context`
+both called `atomic_write_text` without importing it → guaranteed NameError
+at the persistence step (ruff F821). Impact: every document upload through
+`POST /api/context/doc` 500'd *after* paying the full LLM summarisation cost
+(endpoint catches only ValueError/NotImplementedError), and mail-context
+persistence failed likewise. Not in the 2026-07-01 review (modules are
+post-review v2 additions with zero test coverage). Fixed (imports added);
+regression tests added: `tests/cli/test_doc_ingest.py` (4 tests, exercises
+the write path end-to-end with a fake LLM), `tests/cli/test_mail_sync.py`
+(3 tests, COM-free persistence + tokeniser). This is also the explanation
+for why nothing caught it: both modules had no tests at all.
+
+**B-2 (LOW, fixed):** ruff cleanups — unused imports (`resolve_weights_path`
+in cli/main.py, `numpy`/`shutil` in cli/web.py, `sys` in scripts/gpu_check.py,
+`json`/`dataclasses` in transcribe/whisper_runner.py), unused local
+(`tomorrow` in cli/teams_sync.py), `collections` annotation referenced before
+its function-local import in cli/web.py (import moved to module level),
+import-order E402s in cli/web.py (constant moved below imports).
+Remaining baseline: 3 deliberate E402 in transcribe/whisper_runner.py
+(`load_cuda_dlls()` must run before heavy imports — correct as-is).
+
+**B-3 (baseline, recorded): mypy.** `--strict` is not currently meaningful
+(mypy 2.1.0 INTERNAL ERROR at end of run, plus the codebase predates strict
+typing). Default mode: 37 errors = 16 missing-stub noise (pywin32, psutil,
+faster_whisper, rank_bm25) + 21 annotation-looseness findings. Spot-checked
+the plausible-defect candidates (cli/web.py:361 float-into-inferred-str-dict;
+audio_capture lazy-None attributes) — none are runtime defects. Severity: all
+LOW. Recommendation: adopt `check-untyped-defs` incrementally before ever
+attempting `--strict`.
+
+**B-4 (baseline + 1 fix + 1 recommendation): bandit.**
+- Fixed: B324 (HIGH-severity flag, benign use) — `hashlib.sha1` in
+  cli/web.py `_calendar_event_id` is a stable-id hash, not a security hash;
+  marked `usedforsecurity=False`.
+- Recommendation (MEDIUM, deliberate non-fix): B615 — `setup`'s
+  `snapshot_download` has no `revision=` pin, so the one network step trusts
+  the HF repo head at download time. Pinning a known-good revision per model
+  profile in llm/model_profiles.py would close a supply-chain gap. Requires
+  choosing the revisions → queued for [HUMAN DECISION] alongside Strand D's
+  backend recommendation rather than guessed here.
+- Accepted as-is (LOW): B101 asserts in agent/mcp_client.py (internal
+  protocol invariants), B110 try/except/pass in best-effort enrichment
+  paths (deliberate design), B404/B603 subprocess with fixed argv lists
+  (git/serve/process children — no shell, no untrusted argv).
+
+**B-5. State machine — transition table validated, two documentation
+divergences and one dead state found:**
+- Every edge in `ALLOWED_TRANSITIONS` matches the documented graph;
+  `import-transcript` (CLI + web) enters via `create_session(initial_state=
+  STOPPED)` then a legal STOPPED→TRANSCRIBED `transition()` — no bypass,
+  exactly as architecture.md describes.
+- **State `IDLE` is unreachable in practice**: no code path ever creates a
+  session at IDLE (recording tool creates at RECORDING; import at STOPPED),
+  so the IDLE→RECORDING edge is dead. Harmless, but the docs present IDLE
+  as the real start state. Doc-vs-code drift, not a defect.
+- **"Any state → FAILED" is not literal**: IDLE and APPLIED have no FAILED
+  edge (IDLE moot per above; APPLIED is deliberately terminal/archived).
+- **[HUMAN DECISION — flagged] "FAILED (resumable via `meeting-agent
+  process`)" is contradicted by the implementation.** FAILED has an empty
+  allowed-transition set ("terminal for this session_id; retry uses a fresh
+  id", state.py:55), and `process` on a FAILED session raises
+  InvalidTransitionError at the final transition. Three docs claim
+  resumability (architecture.md state graph, whisper_runner.py docstring,
+  mcp-tool-reference error contract pointing at runbook recovery). Either
+  (a) the docs are stale and should say "retry under a fresh session id",
+  or (b) a FAILED→<retry> edge is intended and missing. Changing
+  ALLOWED_TRANSITIONS is a design decision (the prior audit explicitly
+  treated it as frozen) → not changed; awaiting owner call.
+
+**B-6. Directory-structure drift (flagged, doc-side):** actual tree has,
+undocumented in architecture.md's canonical block: `concurrency/{lock.py,
+atomic.py}` (whole package absent from the tree diagram despite being
+central to amendment 4), `cli/feedback.py`, `mcp_server/quality_gate.py`,
+`llm/http_probe.py`, `tests/security/` (new, this audit). Everything the
+diagram *does* list exists. Recommendation: one doc edit adding the five
+entries; deferred to the final report's doc-fix batch rather than editing
+architecture.md piecemeal mid-audit.
+
+**Strand B acceptance criteria:** baseline recorded (this section) — MET;
+state-machine table validated with divergences flagged — MET (one item to
+[HUMAN DECISION]); structure reconciled — MET (drift flagged, doc fix
+queued).
