@@ -20,6 +20,9 @@ def test_parses_well_formed_items(tmp_path):
     assert len(result.items) == 2
     assert result.items[0] == TodoItem(
         description="Buy milk", done=False, id="a1", owner="Naga", due_date="2026-07-04", session_id="s1",
+        # This fixture's meta JSON predates priority/status/source/progress_note/tag,
+        # so status/source parse to their documented "old item" defaults.
+        status="todo", source="legacy",
     )
     assert result.items[1].done is True
 

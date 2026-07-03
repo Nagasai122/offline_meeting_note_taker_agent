@@ -5,6 +5,64 @@
 
 ---
 
+## Resolution status (as of the v2 implementation pass, 2026-07-01)
+
+This review predates the v2 upgrade (`docs/architecture_v2.md`). Left as a historical
+record below, unedited, but here is what actually happened to each finding:
+
+**Fixed:**
+- C1 (event-loop block), C2 (XSS), S1 (`lock_path` hardcode), S2 (`trust_env=False`),
+  S3 (subprocess/in-process apply inconsistency), S5 (BM25 mtime cache), R8 (`print()`
+  in `run_pipeline`), M1 (Nemotron logo) — all resolved. C1/C2/S1/S2/S5/R8/M1 were
+  already fixed prior to the v2 pass; S3 also already correct (`run_pipeline`'s
+  `auto_accept` path calls `apply_reviewed_update` in-process, matching
+  `/api/review/apply`).
+- R5 (`switchTab` data-driven) — fixed as part of the v2 UI redesign
+  (`static/app.js::switchTab` now iterates `[data-tab]` elements).
+- Persona 1's slug-mismatch bug (pinned "IS Sync" → `is-sync`, breaking chaining) —
+  fixed by replacing the ad-hoc button with the IS Call Hub, which generates a proper
+  `is-call-{timestamp}` slug server-side. See `docs/architecture.md`'s v2 section.
+- Persona 2 / 6's context-size truncation on long meetings — fixed by chunked
+  extraction (`transcribe/chunker.py`).
+- Persona 2 / 7's missing per-session Whisper model override — fixed
+  (`--whisper-model` on `process`/`import-transcript`, Settings panel in the UI).
+- Persona 6's mid-meeting context injection — fixed as "highlight with note"
+  (`static/app.js`, `POST /api/record/highlight` with `note`/`segment_offset_seconds`).
+- Persona 8's export/formal-minutes gap — substantially addressed by type-aware MoM
+  generation (`mcp_server/mom_writer.py`) and the MoM preview tab in the meeting-detail
+  modal, though there is still no one-click download/copy button.
+- Persona 9's highlight-to-transcript alignment — fixed
+  (`segment_offset_seconds` computed client-side and stored per highlight).
+- Found and fixed during the v2 pass, not in this review: `cli/git_backup.py`'s
+  `subprocess.run` (used by `apply_reviewed_update`) was still being called
+  synchronously from two async endpoints in `cli/web.py` — the same class of bug as
+  C1, just a call site this review didn't cover. Wrapped in `asyncio.to_thread`.
+
+**Still open (not addressed by v2):**
+- R1/R2/R3/R4/R6/R7, M2–M5 — the redundancy/minor-issue items not listed above as
+  fixed remain as originally described.
+- Persona 3's silent Outlook calendar-sync failure (empty widget, no error shown) —
+  the *new* `cli/mail_sync.py`/`cli/calendar_matcher.py` added in v2 do log/degrade
+  cleanly, but the pre-existing `/api/calendar/sync` widget behaviour is unchanged.
+- Diarisation UI toggle (Personas 3, 10) — still a `settings.toml`-only flag, no
+  one-click UI toggle.
+- Bulk accept/reject button in Needs Review (Persona 4) — not added; each session's
+  decisions still submit together in one request with accept defaulted, which
+  addresses most of the friction but isn't an explicit "Accept All" button.
+- `alert()`/`prompt()` native dialogs (Persona 5) — still used in a few places
+  (already-recording guard, ad-hoc title entry); not replaced with in-page toasts.
+- Confirmation dialog before Apply (Persona 9) — not added; Apply still commits
+  immediately.
+- Per-item project/tag grouping on AI-extracted action items (Persona 10) — manual
+  tasks gained a `tag` field in v2; AI-extracted action items did not.
+
+A newer, separate bug-fix pass (`docs/claude_cli_bugfix_01.md`) identifies five
+additional issues found in a post-v2-implementation test run, including a reported
+regression in the new pre-meeting context modal's Start Recording button. That
+document is its own unit of work, not yet actioned as of this cleanup pass.
+
+---
+
 ## Summary
 
 The codebase is well-structured with a clear, consciously-enforced architecture (zero-egress,

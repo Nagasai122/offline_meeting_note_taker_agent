@@ -141,6 +141,17 @@ def test_search_endpoint_integration(tmp_path):
     meetings_dir.mkdir(parents=True)
     (meetings_dir / "demo-session.summary.md").write_text("Weekly retrospective on the deployment pipeline")
 
+    # SB-6: the endpoint passes state_dir to search_meetings, which only
+    # indexes sessions in PROPOSED/REVIEWED/APPLIED. Give demo-session an
+    # indexable state, otherwise it is (correctly) filtered from the corpus.
+    from mcp_server.state import State, create_session
+
+    state_dir = tmp_path / "data" / "state"
+    state_dir.mkdir(parents=True)
+    create_session(
+        state_dir, "demo-session", state_dir / ".lock", 1.0, initial_state=State.APPLIED
+    )
+
     class _FakeSettings:
         class paths:
             data_dir = str(tmp_path / "data")

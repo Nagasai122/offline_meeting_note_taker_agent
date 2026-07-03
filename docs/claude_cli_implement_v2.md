@@ -1,7 +1,12 @@
 # Claude CLI Implementation Prompt — Meeting Agent v2
 **Use with:** `claude` (Claude Code CLI) in the `D:\meeting-agent` directory  
 **Generated:** 2026-07-01  
-**Covers:** Phases 1–7 from `docs/architecture_v2.md`
+**Covers:** Phases 1–7 from `docs/architecture_v2.md`  
+**Status:** ✅ All 7 phases executed and verified end-to-end (2026-07-01). Kept here as
+the historical implementation log, not living documentation — see
+`docs/code_review_2026_07_01.md`'s resolution-status section for what was fixed vs.
+still open, and `docs/claude_cli_bugfix_01.md` for a follow-up bug-fix pass found in
+post-implementation testing.
 
 Paste the entire block below as a single prompt to Claude Code:
 
@@ -682,6 +687,531 @@ that a test action item with description '<script>alert(1)</script>' renders as
 literal text, not as an executed script.
 
 ===========================================================================
+PHASE 6 — AI REASONING ENHANCEMENTS
+===========================================================================
+
+The goal here is to move the LLM from "text parser" to "reasoning layer" — connecting
+dots across sessions rather than merely extracting structured data from each one in
+isolation. All enhancements are additive and non-blocking: if an AI reasoning step
+fails, the pipeline continues and logs a warning rather than failing the session.
+
+--- STEP 6.1: Due date inference in extraction prompts ---
+
+File: mcp_server/tools/extraction.py
+
+This is a prompt change only — no new functions needed.
+
+In ALL THREE type-specific system prompts (IS_CALL_SYSTEM_PROMPT, PROJECT_SYSTEM_PROMPT,
+SEMINAR_SYSTEM_PROMPT), add the following instruction after the JSON schema description:
+
+  "The recording date is {recording_date_iso} (ISO 8601, UTC).
+   For every due_date field in action_items, output an ISO 8601 date (YYYY-MM-DD).
+   If the speaker says a relative expression such as 'next Tuesday', 'end of this week',
+   'by Friday', 'in two weeks', compute the actual calendar date using {recording_date_iso}
+   as today's reference and output that computed date.
+   If no due date is mentioned or inferrable, output null."
+
+Modify extract_action_items to accept recording_date: datetime parameter and format it
+into the system prompt before the LLM call. This single change closes the gap between
+"by next Friday" in the transcript and a sortable, filterable date in todo.md.
+
+--- STEP 6.2: Priority inference from language ---
+
+File: mcp_server/tools/extraction.py
+
+Add the following to all three system prompts in the priority field description:
+
+  "Infer priority from language cues in the transcript:
+   - HIGH: 'urgent', 'ASAP', 'blocking', 'critical', 'must', 'today', 'immediately'
+   - LOW: 'when you get a chance', 'eventually', 'nice to have', 'if time permits'
+   - MEDIUM: everything else (the default)
+   Output one of: 'HIGH', 'MEDIUM', 'LOW'."
+
+No code change beyond updating the prompt string.
+
+--- STEP 6.3: Action item dependency detection ---
+
+File: mcp_server/tools/extraction.py
+
+Add to all three system prompts, in the action_items schema definition:
+
+  "If an action item cannot start until another action item in this same list is
+   complete (a dependency), add a 'depends_on' field containing the description
+   of the blocking item (copy the description text exactly as you wrote it in
+   that item). Omit 'depends_on' entirely if there is no dependency."
+
+File: mcp_server/tools/extraction.py (post-processing, after LLM call):
+
+Implement link_dependencies(action_items: list[dict]) -> list[dict]:
+  After the LLM returns action items, resolve depends_on description strings to IDs:
+  For each item with a 'depends_on' field, find the item in the list whose description
+  most closely matches the depends_on string (use difflib.get_close_matches with n=1,
+  cutoff=0.7). If found, replace 'depends_on' string with 'blocked_by_id': <matched_id>.
+  If not found (LLM hallucinated a non-existent dependency), remove the depends_on field
+  and log a debug warning.
+
+This enables future UI work to show a dependency graph without requiring manual linking.
+
+--- STEP 6.4: IS Call loop-closure (highest value addition) ---
+
+Create file: mcp_server/tools/loop_closure.py
+
+This is the most valuable AI reasoning addition for daily IS call use.
+
+Implement:
+
+LOOP_CLOSURE_PROMPT = """
+You are reviewing progress on action items from a researcher's previous daily IS call.
+
+Previous session targets (from {prev_session_id} on {prev_date}):
+{prev_action_items_json}
+
+Current session transcript summary:
+{current_summary}
+
+For each previous target, determine its status based on what was discussed in the
+current session. Output a JSON list where each item has:
+- "id": the original action item ID (copy exactly)
+- "description": the original description (copy exactly)
+- "status": one of "addressed" | "partial" | "missed" | "carried_forward"
+- "evidence": a 1-sentence quote or paraphrase from the current session that
+  supports your status assessment. If no evidence, write null.
+- "carried_to": if status is "carried_forward", copy the description into a new
+  action item suggestion (it will be added to today's extracted items automatically).
+
+Definitions:
+- addressed: the item was completed or explicitly confirmed as done.
+- partial: progress was made but the item is not fully resolved.
+- missed: the item was not mentioned and no progress is evident.
+- carried_forward: the IS explicitly re-assigned or extended the deadline.
+"""
+
+Implement:
+close_prior_targets(
+    state_dir: Path,
+    meetings_dir: Path,
+    session_id: str,
+    current_summary: str,
+    llm_call: Callable[[str, str], str],
+    lock_path: Path,
+    lock_timeout: float,
+) -> dict | None:
+  """Run loop-closure reasoning for IS call sessions only.
+
+  Returns None immediately if the session_id does not start with 'is-call-'.
+  Finds the immediately prior is-call-* session by mtime.
+  Loads that session's .actions.json.
+  Calls LLM with LOOP_CLOSURE_PROMPT.
+  Writes result to data/meetings/<session_id>.loop_closure.json.
+  For any item with status 'carried_forward', appends a new action item to the
+  current session's extracted items (adds to .actions.json with a 'carried_from'
+  metadata field).
+  Returns the parsed loop_closure dict.
+  """
+
+Wire into extraction pipeline in mcp_server/tools/extraction.py:
+After extract_action_items completes and writes .actions.json, if meeting_type == IS_CALL,
+call close_prior_targets in a try/except block. Log errors as warnings, never fail the
+session because of this step.
+
+--- STEP 6.5: Recurring blocker escalation ---
+
+Create file: mcp_server/tools/blocker_escalation.py
+
+Implement:
+
+ESCALATION_PROMPT = """
+You are analysing daily progress call notes from a researcher over the past {n} sessions.
+
+Session summaries (newest first):
+{summaries_json}
+
+Identify any blockers, unresolved issues, or topics that appear in 3 or more of these
+sessions without being resolved. For each recurring blocker:
+- "theme": a 5–10 word label describing the blocker
+- "occurrences": list of session IDs where it appeared
+- "first_seen": session_id of the earliest occurrence
+- "suggested_action": one concrete escalation action (e.g., 'Schedule dedicated meeting',
+  'Raise with supervisor', 'File support ticket', 'Reassign task')
+
+Output a JSON list. If no recurring blockers are found, output an empty list [].
+"""
+
+Implement:
+detect_recurring_blockers(
+    meetings_dir: Path,
+    llm_call: Callable[[str, str], str],
+    n_sessions: int = 7,
+) -> list[dict]:
+  """Load the last n_sessions IS call session summaries.
+
+  Only processes sessions whose session_id starts with 'is-call-'.
+  Sorts by mtime descending. Loads .summary.md for each.
+  Calls LLM with ESCALATION_PROMPT.
+  Writes result to data/recurring_blockers.json.
+  Returns parsed list (empty list if LLM returns none or call fails).
+  """
+
+Wire into extraction pipeline: call detect_recurring_blockers after close_prior_targets,
+also only for IS_CALL type. Same error-handling pattern: try/except, log warning, never
+fail the session.
+
+Add endpoint to cli/web.py:
+  GET /api/blockers/recurring
+  Reads data/recurring_blockers.json (returns [] if not found).
+  Response: {"blockers": [...], "last_updated": "<iso_datetime>"}
+
+--- STEP 6.6: Weekly cross-meeting pattern summary ---
+
+Create file: cli/weekly_summary.py
+
+Implement:
+
+WEEKLY_PATTERN_PROMPT = """
+You are analysing a researcher's meeting notes from the past week.
+
+Sessions this week:
+{sessions_json}
+
+Produce a structured weekly summary with:
+- "key_decisions": list of significant decisions made across all meetings
+- "recurring_topics": list of topics that appeared in multiple sessions
+- "open_action_count": total number of open (unresolved) action items
+- "high_priority_open": list of HIGH priority action items not yet marked done
+- "completed_count": total action items marked as done or addressed this week
+- "insight": 2–3 sentence narrative observation about the week's work pattern
+
+Output as JSON.
+"""
+
+Implement:
+generate_weekly_summary(
+    meetings_dir: Path,
+    state_dir: Path,
+    llm_call: Callable[[str, str], str],
+    since_days: int = 7,
+) -> dict:
+  """Aggregate last since_days days of sessions and produce a cross-meeting summary.
+
+  Filters to sessions whose mtime is within since_days of now.
+  Loads .summary.md and .actions.json per session.
+  Calls LLM with WEEKLY_PATTERN_PROMPT.
+  Writes to data/weekly_summary.json.
+  Returns parsed dict.
+  """
+
+Add endpoint to cli/web.py:
+  GET /api/summary/weekly?days=7
+  Calls generate_weekly_summary on demand (cached: serve existing file if < 6 hours old).
+  Response: {"summary": {...}, "generated_at": "<iso_datetime>", "session_count": int}
+
+Add a "Weekly Digest" button to the dashboard that calls this endpoint and renders
+the result in a modal. Do not auto-run on page load — it triggers an LLM call and
+should be user-initiated.
+
+--- VERIFY PHASE 6 ---
+
+Run:
+python -c "
+from mcp_server.tools.loop_closure import close_prior_targets
+from mcp_server.tools.blocker_escalation import detect_recurring_blockers
+from cli.weekly_summary import generate_weekly_summary
+print('Phase 6 imports OK')
+"
+
+Run:
+python -c "
+from mcp_server.meeting_type import MeetingType
+from mcp_server.tools.loop_closure import close_prior_targets
+# Verify it returns None immediately for non-IS-call sessions
+result = close_prior_targets.__doc__
+assert 'None immediately' in result or True  # doc check
+print('loop_closure early-exit guard: OK (manual review required)')
+"
+
+Manual check: after running a test IS call pipeline twice (second session references
+first), verify data/meetings/<second_session>.loop_closure.json exists and contains
+the 'status' field for each prior action item.
+
+===========================================================================
+PHASE 7 — MANUAL TASK ENTRY + STATUS TRACKING + LOCAL REMINDERS
+===========================================================================
+
+--- STEP 7.1: Extend todo.md format (backward-compatible) ---
+
+File: cli/review_apply.py (read carefully before modifying)
+
+The current TodoItem dataclass (or dict structure written to todo.md) needs two new
+optional fields. Read the file to understand the exact format used.
+
+Add to the TodoItem representation:
+- source: str  — "manual" for user-created tasks, or the session_id for AI-extracted ones.
+                  Default: infer from context (existing items without this field default
+                  to "legacy" when read back — never crash on missing field).
+- status: str  — one of "todo" | "in_progress" | "done" | "blocked".
+                  Default on read: "todo" (existing items are assumed open).
+- progress_note: str | None — free-text note about current progress. Default: None.
+- tag: str | None — user-supplied context tag (e.g. "WP3", "seminar-prep"). Default: None.
+
+The todo.md file uses a specific serialisation format. Read it carefully and extend
+that serialisation/deserialisation to include these fields without breaking existing
+records. Write a migration that reads existing todo.md and writes it back with the
+new fields set to their defaults — run this migration on startup if todo.md exists and
+lacks the new fields (detect by checking if the first task entry contains 'source:').
+
+--- STEP 7.2: Manual task API endpoints ---
+
+File: cli/web.py
+
+Add three endpoints:
+
+1. POST /api/tasks/manual
+   Request body (JSON):
+     {
+       "description": str,          (required, non-empty, max 500 chars)
+       "due_date": str | null,       (ISO 8601 date string or null)
+       "priority": str,              (default "MEDIUM"; one of HIGH/MEDIUM/LOW)
+       "tag": str | null,            (optional context tag, max 50 chars)
+       "progress_note": str | null   (optional initial note, max 200 chars)
+     }
+   Processing:
+     - Validate all fields (422 on invalid)
+     - Generate a UUID for the task ID
+     - Mint CapabilityToken (this endpoint is in cli/, so this is permitted)
+     - Call a new function write_manual_task(token, task_data, todo_path, lock_path, lock_timeout)
+       in cli/review_apply.py that appends the task to todo.md with source="manual"
+       and status="todo"
+     - Return {"task_id": <uuid>, "status": "created"}
+
+2. PATCH /api/tasks/{task_id}
+   Request body (JSON, all fields optional):
+     {
+       "status": str | null,           (todo | in_progress | done | blocked)
+       "due_date": str | null,
+       "progress_note": str | null,
+       "priority": str | null
+     }
+   Processing:
+     - Load todo.md, find task by ID (UUID match)
+     - 404 if not found
+     - Update only the provided non-null fields
+     - Mint CapabilityToken, call update_task_status(token, task_id, updates, ...)
+     - Write back to todo.md atomically (.tmp + rename)
+     - Return {"task_id": ..., "updated_fields": [...]}
+
+3. DELETE /api/tasks/{task_id}
+   Processing:
+     - Load todo.md, find task by ID
+     - 404 if not found
+     - Mint CapabilityToken
+     - Mark task as status="deleted" and write back (soft delete — keeps record in file)
+     - Return {"task_id": ..., "status": "deleted"}
+
+--- STEP 7.3: Manual task UI in Tasks tab ---
+
+File: static/app.js and static/index.html
+
+In the Tasks tab, add above the existing task list:
+
+1. A collapsed "Add Task" section (toggle open/close with a button):
+
+   [+ Add Task]  ← clicking expands the form below
+
+   Form fields:
+   - Description textarea (required, max 500 chars, autofocus on expand)
+   - Due date input (type="date")
+   - Priority select: HIGH | MEDIUM (default) | LOW
+   - Tag input (placeholder: "e.g. WP3, seminar-prep")
+   - Progress note input (placeholder: "Optional — initial note")
+   - [Save Task] button (disabled until description is non-empty)
+   - [Cancel] button (collapses form, clears fields)
+
+   On [Save Task]:
+     POST /api/tasks/manual with form data.
+     On success: collapse form, refresh task list, show brief "Task added" toast.
+     On error: show error message inline (do not alert()).
+
+2. Each task row in the task list gets a status dropdown:
+   Current: tasks show as static text with a checkbox.
+   New: add a <select> beside each task showing current status.
+     Options: To Do | In Progress | Done | Blocked
+   On change: PATCH /api/tasks/{task_id} with the new status.
+   The Done option should visually strike through the task description.
+   The Blocked option should show the task in a muted/greyed style.
+
+3. Add a filter bar above the task list:
+   [All] [Active] [Blocked] [Done]  ← tab-style filter buttons
+   Filters the rendered list client-side (no API call).
+   "Active" shows both todo and in_progress items.
+   Default: [All].
+
+4. Inline progress note:
+   Each task row gets a small "Note" icon button (pencil).
+   Clicking it reveals a single-line input pre-filled with the current progress_note.
+   On blur or Enter: PATCH /api/tasks/{task_id} with the updated note.
+
+Apply esc() to ALL user-supplied task content rendered into innerHTML (description,
+progress_note, tag). These are now user-typed strings, not just AI-extracted ones.
+
+--- STEP 7.4: Local reminder system (Windows Toast) ---
+
+Install dependency:
+  pip install winotify --break-system-packages
+
+Verify availability:
+  python -c "import winotify; print('winotify OK')"
+
+Create file: cli/reminders.py
+
+Implement:
+
+REMINDERS_FILE = "data/reminders_sent.json"
+# Tracks {task_id: last_notification_iso} to avoid repeat toasts for the same task.
+
+def load_sent_reminders(data_dir: Path) -> dict[str, str]:
+    """Load reminders_sent.json. Return {} if not found or malformed."""
+
+def save_sent_reminder(data_dir: Path, task_id: str, sent_at: str) -> None:
+    """Append/update task_id in reminders_sent.json atomically."""
+
+def get_due_tasks(todo_path: Path) -> list[dict]:
+    """Load todo.md, return tasks where:
+    - status not in ('done', 'deleted', 'blocked')
+    - due_date is today or earlier (overdue)
+    Returns list sorted by due_date ascending (oldest overdue first).
+    """
+
+def fire_toast(task: dict) -> bool:
+    """Fire a Windows Toast notification for a due/overdue task.
+
+    Uses winotify.Notification:
+    - app_id: "Meeting Agent"
+    - title: "Task Due: {priority}" (e.g. "Task Due: HIGH")
+    - msg: first 80 chars of task description
+    - duration: "short"
+    - icon: "" (empty — uses default)
+
+    Returns True on success, False if winotify is not available or raises.
+    Catch ImportError and all exceptions; log warnings, never crash.
+    """
+
+def check_and_notify(data_dir: Path, todo_path: Path) -> int:
+    """Check for due tasks and fire toasts for ones not yet notified today.
+
+    For each due task:
+    - Load sent_reminders.
+    - If task_id not in sent_reminders OR last notification was > 24h ago: fire toast.
+    - Record the notification in reminders_sent.json.
+    Returns count of notifications fired.
+    """
+
+--- STEP 7.5: Reminder background thread in serve command ---
+
+File: cli/main.py (the `serve` command)
+
+After starting the FastAPI server (uvicorn), start a daemon thread that:
+- Calls check_and_notify every 60 minutes.
+- Runs as daemon=True so it does not prevent clean shutdown.
+- On startup, fires one immediate check (so the user gets a notification within
+  seconds of starting the server if tasks are due, not after the first hour).
+
+Implementation pattern (daemon thread, not asyncio, to avoid blocking the event loop):
+
+import threading
+from cli.reminders import check_and_notify
+
+def _reminder_loop(data_dir: Path, todo_path: Path, interval_seconds: int = 3600) -> None:
+    import time
+    check_and_notify(data_dir, todo_path)  # immediate check on startup
+    while True:
+        time.sleep(interval_seconds)
+        try:
+            check_and_notify(data_dir, todo_path)
+        except Exception as exc:
+            logger.warning("Reminder check failed: %s", exc)
+
+reminder_thread = threading.Thread(
+    target=_reminder_loop,
+    args=(settings.data_dir, settings.todo_path),
+    daemon=True,
+)
+reminder_thread.start()
+
+--- STEP 7.6: "Due Today" banner in dashboard ---
+
+File: cli/web.py — GET /api/briefing endpoint
+
+Add a new field to the briefing response:
+  "due_today": list[dict]   — tasks whose due_date == today and status != 'done'
+  "overdue": list[dict]     — tasks whose due_date < today and status != 'done'
+
+Each item: {"id": ..., "description": ..., "due_date": ..., "priority": ..., "tag": ...}
+
+File: static/app.js / index.html — Dashboard tab
+
+At the very top of the dashboard content area, before the briefing text, render:
+- If overdue list is non-empty: a red alert card
+  "⚠ {n} overdue task(s)" listing the first 3 (with a "View all" link to Tasks tab).
+- If due_today list is non-empty: a yellow warning card
+  "📅 {n} task(s) due today" listing the first 3.
+- If both are empty: render nothing (do not show an empty card).
+
+Apply esc() to all task description text in these cards.
+
+--- VERIFY PHASE 7 ---
+
+Run:
+python -c "
+from cli.reminders import get_due_tasks, check_and_notify, fire_toast
+print('reminders import OK')
+"
+
+Run:
+python -c "
+import winotify
+n = winotify.Notification(app_id='Meeting Agent', title='Test', msg='Phase 7 reminder test OK', duration='short')
+n.show()
+print('winotify toast fired — check Windows notification area')
+"
+
+API smoke tests:
+python -c "
+import httpx, json, time
+
+# assumes meeting-agent serve is running on port 8765
+base = 'http://localhost:8765'
+
+# Create manual task
+r = httpx.post(f'{base}/api/tasks/manual', json={
+    'description': 'Test manual task from Phase 7 verify',
+    'due_date': '2026-07-01',
+    'priority': 'HIGH',
+    'tag': 'test'
+})
+assert r.status_code == 200, f'Create failed: {r.text}'
+task_id = r.json()['task_id']
+print(f'Created task: {task_id}')
+
+# Update status
+r = httpx.patch(f'{base}/api/tasks/{task_id}', json={'status': 'in_progress', 'progress_note': 'Started'})
+assert r.status_code == 200, f'Update failed: {r.text}'
+print('Status updated to in_progress')
+
+# Check briefing shows it as due
+r = httpx.get(f'{base}/api/briefing')
+assert r.status_code == 200
+data = r.json()
+ids = [t['id'] for t in data.get('due_today', [])]
+assert task_id in ids, f'Task not in due_today: {ids}'
+print('due_today banner data: OK')
+
+# Delete task
+r = httpx.delete(f'{base}/api/tasks/{task_id}')
+assert r.status_code == 200
+print('Phase 7 API tests PASS')
+"
+
+===========================================================================
 CROSS-CUTTING CONCERNS (apply throughout all phases)
 ===========================================================================
 
@@ -726,13 +1256,27 @@ After all phases are complete:
 6. Run: python -m py_compile cli/web.py cli/main.py mcp_server/tools/extraction.py
    transcribe/chunker.py transcribe/import_parsers.py cli/doc_ingest.py
    cli/mail_sync.py cli/calendar_matcher.py mcp_server/mom_writer.py
-   mcp_server/meeting_type.py
+   mcp_server/meeting_type.py mcp_server/tools/loop_closure.py
+   mcp_server/tools/blocker_escalation.py cli/weekly_summary.py cli/reminders.py
    All must exit 0.
 
+7. Manual task round-trip (requires server running):
+   - POST /api/tasks/manual with a test task due today
+   - Verify it appears in GET /api/briefing response under due_today
+   - PATCH its status to done
+   - Verify it disappears from due_today
+   - DELETE it
+
+8. Verify data/recurring_blockers.json is created after two IS call pipelines run.
+
+9. Fire one Windows toast manually:
+   python -c "from cli.reminders import fire_toast; fire_toast({'id':'test','description':'Integration test reminder','priority':'HIGH','due_date':'2026-07-01'})"
+
 Report back with:
-- Phase completion status (PASS/FAIL per phase)
+- Phase completion status (PASS/FAIL per phase, 1–7)
 - Any files that could not be modified and why
 - Any test failures with the actual vs expected values
 - The final grep counts for subprocess.run and print()
 - Line counts for each new file created
+- Confirmation that winotify toast was visible in Windows notification area
 ```

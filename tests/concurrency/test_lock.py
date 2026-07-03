@@ -9,18 +9,49 @@ from concurrency.lock import FileLock, LockTimeoutError
 
 
 def test_acquire_and_release_roundtrip(tmp_path):
+    # The lock *file* now persists across acquire/release cycles under the
+    # portalocker-backed implementation -- it's a lock target, not lock state
+    # (the OS-level lock on the open handle is what conveys exclusivity, and
+    # that's what's released, not the file's existence). See concurrency/lock.py's
+    # module docstring for why this is a deliberate improvement over the
+    # previous create-then-delete-file behaviour this test used to assert.
     lock = FileLock(tmp_path / "x.lock", timeout_seconds=1.0)
     lock.acquire()
     assert (tmp_path / "x.lock").exists()
     lock.release()
-    assert not (tmp_path / "x.lock").exists()
+    assert (tmp_path / "x.lock").exists()  # persists; just no longer held
 
 
 def test_context_manager_releases_on_exit(tmp_path):
     lock_path = tmp_path / "x.lock"
     with FileLock(lock_path, timeout_seconds=1.0):
         assert lock_path.exists()
-    assert not lock_path.exists()
+    assert lock_path.exists()  # persists; a second acquire below proves it's released
+
+    # Prove release actually happened (not just that the file wasn't deleted):
+    # a fresh acquire against the same path must succeed immediately.
+    second = FileLock(lock_path, timeout_seconds=0.5)
+    second.acquire()
+    second.release()
+
+
+def test_crashed_holder_does_not_permanently_block_a_new_acquire(tmp_path):
+    """The correctness property Fix D exists for: a process that dies without
+    calling release() (a crash, kill -9, unclean shutdown) must not leave the
+    lock stuck forever. Simulated here by closing the file handle directly
+    (bypassing FileLock.release()'s portalocker.unlock() call) -- the closest
+    a single-process test can get to "the OS reclaims the handle on process
+    exit" without literally spawning and killing a subprocess. No PID file,
+    no staleness heuristic, no unlink race: the OS-level lock on that handle
+    is simply gone once the handle is gone."""
+    lock_path = tmp_path / "x.lock"
+    crashed = FileLock(lock_path, timeout_seconds=1.0)
+    crashed.acquire()
+    crashed._fh.close()  # simulate an ungraceful death -- no release(), no unlock()
+
+    contender = FileLock(lock_path, timeout_seconds=2.0, poll_interval_seconds=0.05)
+    contender.acquire()  # must not raise LockTimeoutError
+    contender.release()
 
 
 def test_second_acquire_times_out_while_held(tmp_path):

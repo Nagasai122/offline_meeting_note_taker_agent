@@ -23,6 +23,21 @@ def transcribe_meeting(
     diarisation_enabled: bool = False,
 ) -> dict:
     validate_session_id(session_id)
+    # Fix 1.1: guard against re-transcription if session has already advanced
+    # past STOPPED (e.g. agent retried transcribe_meeting on an already-TRANSCRIBED session).
+    try:
+        current = state_mod.load_session_state(state_dir, session_id)
+        if current.state != state_mod.State.STOPPED:
+            return {
+                "status": "skipped",
+                "reason": (
+                    f"Session already in state {current.state.value}; "
+                    "transcription is only valid from STOPPED."
+                ),
+                "current_state": current.state.value,
+            }
+    except FileNotFoundError:
+        pass  # no state file yet — proceed (create_session is in _transcribe_meeting)
     try:
         transcript_path = _transcribe_meeting(
             session_id=session_id,

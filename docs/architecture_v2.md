@@ -1,6 +1,10 @@
 # Meeting Agent — Architecture v2 Specification
 **Date:** 2026-07-01  
-**Status:** Approved for implementation  
+**Status:** ✅ Implemented (2026-07-01) — see `docs/architecture.md`'s v2 section for a
+summary of what landed and a few deliberate deviations from the literal spec below
+(e.g. the extraction JSON contract stayed additive rather than diverging per type, to
+preserve backward compatibility with the existing pipeline). A follow-up bug-fix pass
+is tracked separately in `docs/claude_cli_bugfix_01.md`.  
 **Author:** System Architecture Review
 
 ---

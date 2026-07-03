@@ -103,14 +103,30 @@ def _load_corpus(meetings_dir: Path, signature: float) -> tuple[list[tuple[str, 
     return docs, corpus
 
 
+def _is_indexable(session_id: str, state_dir: Path) -> bool:
+    """SB-6: only sessions at PROPOSED, REVIEWED, or APPLIED have been through
+    extraction and human review — earlier states (STOPPED, TRANSCRIBED, EXTRACTED)
+    contain provisional data that has not yet been seen by the user."""
+    try:
+        from mcp_server.state import load_session_state, State
+        _INDEXABLE = {State.PROPOSED, State.REVIEWED, State.APPLIED}
+        return load_session_state(state_dir, session_id).state in _INDEXABLE
+    except FileNotFoundError:
+        return False
+
+
 def search_meetings(
     meetings_dir: Path | str,
     query: str,
     max_results: int = 10,
+    state_dir: Path | None = None,
 ) -> list[SearchResult]:
     """Rank the (cached) corpus built from all .summary.md and .md files
     under meetings_dir against `query`, and return up to `max_results`
-    results with a score and snippet."""
+    results with a score and snippet.
+
+    SB-6: when `state_dir` is provided, only sessions in an indexable state
+    (PROPOSED, REVIEWED, APPLIED) are included in the corpus."""
     from rank_bm25 import BM25Plus
 
     meetings_dir = Path(meetings_dir)
@@ -118,9 +134,22 @@ def search_meetings(
     if not query_tokens or not meetings_dir.exists():
         return []
 
-    docs, corpus = _load_corpus(meetings_dir, _corpus_signature(meetings_dir))
-    if not docs:
+    all_docs, all_corpus = _load_corpus(meetings_dir, _corpus_signature(meetings_dir))
+    if not all_docs:
         return []
+
+    if state_dir is not None:
+        filtered = [
+            (doc, tok)
+            for doc, tok in zip(all_docs, all_corpus)
+            if _is_indexable(doc[0], state_dir)
+        ]
+        if not filtered:
+            return []
+        docs, corpus = zip(*filtered)
+        docs, corpus = list(docs), list(corpus)
+    else:
+        docs, corpus = all_docs, all_corpus
 
     # BM25Plus (not BM25Okapi): IDF = log(N/n + 1) is strictly positive, so
     # a single-document corpus still returns a non-zero score for matching terms.

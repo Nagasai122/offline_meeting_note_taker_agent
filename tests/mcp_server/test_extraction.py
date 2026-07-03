@@ -8,6 +8,18 @@ from mcp_server.state import State, create_session, load_session_state
 from mcp_server.tools.extraction import ExtractionError, extract_action_items
 from tests.mcp_server.fakes import FakeLLMClient
 
+# Fix 2.3 in mcp_server/tools/extraction.py skips the LLM entirely for
+# transcripts under MIN_TRANSCRIPT_WORDS (50) words. Tests that need the fake
+# LLM to actually be consulted must therefore use a transcript longer than
+# that threshold; this filler sentence block is ~52 words on its own.
+_FILLER = (
+    "We spent the first part of the meeting walking through the deployment "
+    "checklist, reviewing open incidents, and agreeing on owners for each "
+    "remaining task before the release. Everyone confirmed the staging "
+    "environment matched production configuration and that the rollback plan "
+    "had been rehearsed end to end earlier this week without any surprises."
+)
+
 
 def _setup(tmp_path, segments):
     meetings_dir = tmp_path / "meetings"
@@ -21,9 +33,18 @@ def _setup(tmp_path, segments):
 
 def test_extract_action_items_happy_path(tmp_path):
     meetings_dir, state_dir, lock_path = _setup(
-        tmp_path, [{"speaker": "Naga", "text": "I will send the report by Friday."}]
+        tmp_path,
+        [
+            {"speaker": "Naga", "text": _FILLER},
+            {"speaker": "Naga", "text": "I will send the report by Friday."},
+        ],
     )
-    llm = FakeLLMClient(response='[{"description": "Send the report", "owner": "Naga", "due_date": "2026-07-03"}]')
+    llm = FakeLLMClient(
+        response=json.dumps({
+            "summary": "- Report due Friday.",
+            "action_items": [{"description": "Send the report", "owner": "Naga", "due_date": "2026-07-03"}],
+        })
+    )
 
     result = extract_action_items("s1", meetings_dir, state_dir, lock_path, 1.0, llm)
 
@@ -35,11 +56,18 @@ def test_extract_action_items_happy_path(tmp_path):
 
 
 def test_extract_action_items_strips_markdown_fence(tmp_path):
-    meetings_dir, state_dir, lock_path = _setup(tmp_path, [{"speaker": "A", "text": "No action needed."}])
-    llm = FakeLLMClient(response="```json\n[]\n```")
+    meetings_dir, state_dir, lock_path = _setup(
+        tmp_path,
+        [
+            {"speaker": "A", "text": _FILLER},
+            {"speaker": "A", "text": "No action needed."},
+        ],
+    )
+    llm = FakeLLMClient(response='```json\n{"summary": "- Nothing to do.", "action_items": []}\n```')
 
     result = extract_action_items("s1", meetings_dir, state_dir, lock_path, 1.0, llm)
     assert result["action_items"] == []
+    assert len(llm.calls) == 1  # the fenced response really was parsed, not skipped
 
 
 def test_extract_action_items_no_transcript_raises(tmp_path):
@@ -51,7 +79,7 @@ def test_extract_action_items_no_transcript_raises(tmp_path):
 
 
 def test_malformed_llm_response_raises_extraction_error_and_marks_failed(tmp_path):
-    meetings_dir, state_dir, lock_path = _setup(tmp_path, [{"speaker": "A", "text": "Hello."}])
+    meetings_dir, state_dir, lock_path = _setup(tmp_path, [{"speaker": "A", "text": _FILLER}])
     llm = FakeLLMClient(response="not json at all")
 
     with pytest.raises(ExtractionError):
@@ -61,8 +89,8 @@ def test_malformed_llm_response_raises_extraction_error_and_marks_failed(tmp_pat
 
 
 def test_llm_response_missing_description_field_raises(tmp_path):
-    meetings_dir, state_dir, lock_path = _setup(tmp_path, [{"speaker": "A", "text": "Hello."}])
-    llm = FakeLLMClient(response='[{"owner": "X"}]')
+    meetings_dir, state_dir, lock_path = _setup(tmp_path, [{"speaker": "A", "text": _FILLER}])
+    llm = FakeLLMClient(response='{"summary": "- x", "action_items": [{"owner": "X"}]}')
 
     with pytest.raises(ExtractionError, match="missing 'description'"):
         extract_action_items("s1", meetings_dir, state_dir, lock_path, 1.0, llm)

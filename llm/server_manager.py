@@ -82,6 +82,38 @@ def _privacy_env(disable_telemetry_env: list[str]) -> dict[str, str]:
     return env
 
 
+def resolve_llama_server_exe() -> str:
+    """Resolve the llama-server executable, with a clear diagnostic for the one
+    case that is unambiguously a misconfiguration: `LLAMA_SERVER_EXE` is set but
+    points at a file that doesn't exist (root cause A from the bugfix-01 report --
+    a session-scoped env var that got lost on terminal close and was re-set wrong,
+    or a stale path after moving llama-server.exe).
+
+    When `LLAMA_SERVER_EXE` is unset, this deliberately does NOT pre-validate
+    against `shutil.which` and hard-fail here: on Windows, `subprocess.Popen`'s
+    own CreateProcess-based PATH resolution can succeed for names `shutil.which`
+    doesn't detect the same way (e.g. App Execution Aliases), so a `shutil.which`
+    pre-check would produce false-negative failures for a setup that actually
+    works. The bare 'llama-server' string is passed straight to Popen, exactly as
+    before this function existed; if that genuinely can't be found, Popen itself
+    raises immediately, and the early-exit / timeout diagnostics in start_server
+    below (last output, common causes) still apply.
+    """
+    env_override = os.getenv("LLAMA_SERVER_EXE", "").strip()
+    if env_override:
+        if not Path(env_override).exists():
+            raise FileNotFoundError(
+                f"LLAMA_SERVER_EXE is set to '{env_override}' but that file does not exist.\n"
+                "Fix: check the path, or re-point it at your actual llama-server.exe, e.g.:\n"
+                "  [System.Environment]::SetEnvironmentVariable('LLAMA_SERVER_EXE', "
+                "'D:\\llama.cpp\\llama-server.exe', 'User')\n"
+                "Then open a new terminal and retry."
+            )
+        return env_override
+
+    return "llama-server"
+
+
 def _build_launch_command(
     profile: ModelProfile,
     weights_path: Path,
@@ -92,7 +124,10 @@ def _build_launch_command(
         # Resolved via PATH by default. A developer-machine-specific absolute path
         # was previously hardcoded here, which silently broke on any other machine —
         # use the LLAMA_SERVER_EXE environment variable as the one supported override.
-        exe_path = os.environ.get("LLAMA_SERVER_EXE", "llama-server")
+        # resolve_llama_server_exe() fails fast with actionable instructions instead
+        # of letting a missing/misconfigured exe surface later as a 300s health-check
+        # timeout with no explanation.
+        exe_path = resolve_llama_server_exe()
         cmd = [
             exe_path,
             "--model", str(weights_path),
@@ -156,7 +191,11 @@ def start_server(
 
     handle = ServerHandle(process=process, host=host, port=port, profile=profile)
     deadline = time.monotonic() + startup_timeout_seconds
-    health_url = f"{handle.base_url}{health_check_path}"
+    # Some llama-server builds expose /v1/health instead of (or in addition to)
+    # /health; try the configured path first, then that fallback, each poll.
+    health_paths = [health_check_path]
+    if "/v1/health" not in health_paths:
+        health_paths.append("/v1/health")
 
     while time.monotonic() < deadline:
         if not handle.is_running():
@@ -164,21 +203,32 @@ def start_server(
             output = "\n".join(startup_log)
             raise ServerLaunchError(
                 f"LLM server process exited early (code={process.returncode}). "
-                f"Output:\n{output}"
+                f"Output:\n{output}\n"
+                "Common causes: model weights not found (run `meeting-agent setup "
+                "--profile <name>`), CUDA out of memory (reduce --n-gpu-layers), or "
+                "a corrupt download (delete models/ and re-run setup)."
             )
-        try:
-            # trust_env=False: ignore HTTP_PROXY/ALL_PROXY env vars for this
-            # loopback health check, consistent with the loopback-only guarantee.
-            response = httpx.get(health_url, timeout=2.0, trust_env=False)
-            if response.status_code == 200:
-                logger.info("LLM server healthy at %s", handle.base_url)
-                return handle
-        except httpx.RequestError:
-            pass  # not up yet, keep polling
+        for path in health_paths:
+            try:
+                # trust_env=False: ignore HTTP_PROXY/ALL_PROXY env vars for this
+                # loopback health check, consistent with the loopback-only guarantee.
+                response = httpx.get(f"{handle.base_url}{path}", timeout=2.0, trust_env=False)
+                if response.status_code == 200:
+                    logger.info("LLM server healthy at %s%s", handle.base_url, path)
+                    return handle
+            except httpx.RequestError:
+                pass  # not up yet, keep polling
         time.sleep(poll_interval_seconds)
 
     handle.stop()
+    log_tail = list(startup_log)[-20:]
+    log_text = "\n".join(log_tail) if log_tail else "(no output captured — process may not have started)"
     raise ServerLaunchError(
         f"LLM server did not become healthy within {startup_timeout_seconds:.0f}s "
-        f"(profile={profile.name}, url={health_url})."
+        f"(profile={profile.name}, url={handle.base_url}{health_check_path}).\n"
+        f"Last server output:\n{log_text}\n"
+        "If you see 'model file does not exist': run `meeting-agent setup --profile <name>`.\n"
+        "If you see a CUDA error: check `nvidia-smi` and your driver version.\n"
+        "If there is no output at all: confirm LLAMA_SERVER_EXE points at a real "
+        "executable (see resolve_llama_server_exe)."
     )

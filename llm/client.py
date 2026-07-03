@@ -42,6 +42,10 @@ class HttpLLMClient(LLMClient):
             ],
             "temperature": self.temperature,
             "max_tokens": 1024,
+            # SB-1.1: disable prompt-caching so KV cache from one session's
+            # extraction call never bleeds into another session's. This tool is
+            # intentionally single-user, so the performance trade-off is accepted.
+            "cache_prompt": False,
         }
         try:
             response = httpx.post(

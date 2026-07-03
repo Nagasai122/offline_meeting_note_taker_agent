@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 from cli.briefing import build_daily_briefing, render_briefing
 from mcp_server.state import State, create_session, transition
@@ -71,7 +71,11 @@ def test_missing_todo_file_renders_cleanly_as_no_open_tasks(tmp_path):
 
 def test_pipeline_status_groups_sessions_by_state_and_recency(tmp_path):
     dirs = _dirs(tmp_path)
-    today = date(2026, 6, 30)
+    # create_session() stamps history entries with the real wall-clock time
+    # (mcp_server.state._now()), so `today` must track the real date here --
+    # unlike the due-date bucketing tests above, which compare against
+    # hardcoded due_date strings and have no real-clock dependency at all.
+    today = datetime.now(timezone.utc).date()
     create_session(dirs["state_dir"], "proposed-1", dirs["lock_path"], 1.0, initial_state=State.PROPOSED)
     create_session(dirs["state_dir"], "reviewed-1", dirs["lock_path"], 1.0, initial_state=State.REVIEWED)
     create_session(dirs["state_dir"], "failed-1", dirs["lock_path"], 1.0, initial_state=State.FAILED)

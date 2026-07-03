@@ -5,8 +5,8 @@ import sys
 from audio_capture.device_probe import DeviceInfo, format_devices, list_loopback_devices
 
 
-def test_list_loopback_devices_empty_on_non_windows():
-    assert sys.platform != "win32"
+def test_list_loopback_devices_empty_on_non_windows(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
     assert list_loopback_devices() == []
 
 

@@ -34,11 +34,18 @@ live..." far longer than any real meeting plausibly ran, the owning process
 likely crashed or was killed without reaching `STOPPED`. Two layers now
 handle this automatically rather than requiring you to delete files by hand:
 
-1. `concurrency/lock.py`'s `FileLock` checks the PID recorded inside
-   `data/state/.lock` on contention; if that PID is no longer running, the
-   lock is cleared and the acquire retried immediately, instead of waiting
-   out the full `lock_timeout_seconds` and raising `LockTimeoutError` against
-   a lock nobody actually still holds.
+1. `concurrency/lock.py`'s `FileLock` is backed by `portalocker` (OS-level
+   file locking): if the process that crashed was holding `data/state/.lock`,
+   the OS releases that lock automatically when its file handle closes --
+   including on a crash or `kill -9` -- so a new acquire succeeds without
+   waiting out `lock_timeout_seconds`. (An earlier version of this module
+   used a hand-rolled PID-file staleness check instead; it was replaced
+   after a QA pass found a TOCTOU race in it -- see `concurrency/lock.py`'s
+   module docstring.) The lock file itself now persists across acquire/
+   release cycles (it's a lock target, not lock state) rather than being
+   deleted each time -- if you ever need to inspect who last held it, its
+   contents are the PID that most recently acquired it (best-effort
+   diagnostic only, not part of the locking mechanism itself).
 2. The session record itself is not cleared by the lock fix alone -- run:
 
    ```
@@ -157,6 +164,43 @@ a change of `[llm].backend`), re-run `scripts/network_audit.py` across a full
 `[privacy].disable_telemetry_env` flag names in `config/settings.toml` against
 the installed library versions — `VLLM_NO_USAGE_STATS` in particular is
 explicitly flagged in `docs/architecture.md` as "last verified," not eternal.
+
+## v2 additions: context enrichment, chunking, reminders
+
+- **Document/mail/calendar context enrichment is always best-effort.** If
+  `cli/doc_ingest.py`, `cli/mail_sync.py`, or `cli/calendar_matcher.py` fail
+  (Outlook not open, malformed `data/calendar.json`, unreadable upload), the
+  failure is logged as a warning and the pipeline continues — it never
+  transitions the session to `FAILED` on account of enrichment alone. If
+  context you expected to see in a MoM is missing, check the dashboard/CLI
+  logs for a warning from one of these three modules rather than assuming
+  extraction itself failed.
+- **Chunked extraction** (`transcribe/chunker.py`) kicks in automatically
+  above ~5000 estimated tokens (~35 minutes of speech); below that, extraction
+  is still a single LLM call. If a long meeting's MoM looks noticeably
+  shorter than expected, check for `<session_id>.chunk_N.json` files under
+  `data/meetings/` — their presence confirms chunking ran; their absence on a
+  long transcript is itself worth investigating (possible mis-estimation of
+  token count).
+- **Loop closure and recurring-blocker detection** (`mcp_server/tools/loop_closure.py`,
+  `mcp_server/tools/blocker_escalation.py`) only run for `is-call-*` sessions,
+  and are wrapped the same best-effort way as context enrichment — a failure
+  here is logged, never fails the session.
+- **Local reminders** (`cli/reminders.py`) require `winotify` and only fire
+  from the `meeting-agent web` process (a daemon thread started in
+  `cli/main.py::web`, not `serve`). If toasts aren't appearing:
+  1. Confirm `python -c "import winotify"` succeeds.
+  2. Confirm `meeting-agent web` (not just `serve`) is the process you have
+     running — `serve` only starts the LLM server, it does not start the
+     reminder thread.
+  3. Check `data/reminders_sent.json` — a task already notified within the
+     last 24h is deliberately not re-notified.
+- **Transcript import** (`meeting-agent import-transcript`,
+  `POST /api/upload/transcript`) creates the session at `STOPPED` then
+  transitions to `TRANSCRIBED` — same `transition()` path as a real
+  recording, just with no audio to delete. If an import fails partway, the
+  session lands in `FAILED` the same as any other extraction failure; recover
+  via the "Recovering a session stuck at FAILED" section above.
 
 ## Known limitations (not bugs)
 

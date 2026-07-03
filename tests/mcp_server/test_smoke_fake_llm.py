@@ -32,12 +32,15 @@ def test_transcribed_to_proposed_round_trip_with_fake_llm(tmp_path):
     state_dir = tmp_path / "state"
     lock_path = tmp_path / ".lock"
 
+    # Transcript must exceed MIN_TRANSCRIPT_WORDS (50) in extraction.py so the
+    # too-short guard does not short-circuit before calling the FakeLLMClient.
     (meetings_dir / "standup-1.json").write_text(
         json.dumps(
             {
                 "segments": [
-                    {"speaker": "Naga", "text": "I'll write up the architecture doc by Thursday."},
-                    {"speaker": "Alex", "text": "Sounds good, I'll review it Friday."},
+                    {"speaker": "Naga", "text": "Good morning everyone. Today I want to discuss the architecture document. I will write up the full architecture doc covering the agent loop, the MCP tool server, and the review-apply pipeline by Thursday end of day."},
+                    {"speaker": "Alex", "text": "Sounds good. I will review it on Friday morning and provide written feedback by Friday afternoon. We should make sure the document covers the state machine transitions and the capability token flow as well."},
+                    {"speaker": "Naga", "text": "Agreed. I will include those sections. Let us also add a section on the loopback audio capture and the live transcription fallback logic."},
                 ]
             }
         )
@@ -46,10 +49,13 @@ def test_transcribed_to_proposed_round_trip_with_fake_llm(tmp_path):
 
     fake_llm = FakeLLMClient(
         response=json.dumps(
-            [
-                {"description": "Write up the architecture doc", "owner": "Naga", "due_date": "2026-07-02"},
-                {"description": "Review the architecture doc", "owner": "Alex", "due_date": "2026-07-03"},
-            ]
+            {
+                "summary": "- Architecture doc assigned and reviewed.",
+                "action_items": [
+                    {"description": "Write up the architecture doc", "owner": "Naga", "due_date": "2026-07-02"},
+                    {"description": "Review the architecture doc", "owner": "Alex", "due_date": "2026-07-03"},
+                ],
+            }
         )
     )
 

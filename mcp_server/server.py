@@ -15,7 +15,8 @@ extract_action_items, propose_todo_update) plus three read-only query tools
 enough situational awareness to decide what to do next without re-deriving it
 from raw files.
 
-`apply_reviewed_update` is deliberately not imported here at all (see
+The reviewed-update applier (cli/review_apply.py) is deliberately not
+imported here at all (see
 mcp_server/tools/review.py's module docstring) -- per critique amendment 2,
 this is enforced structurally, not by registering it and then refusing calls
 to it at runtime.

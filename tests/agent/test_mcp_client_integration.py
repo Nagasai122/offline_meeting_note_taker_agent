@@ -27,15 +27,22 @@ from mcp_server.state import create_session
 
 
 def _write_settings(tmp_path: Path) -> Path:
+    # TOML double-quoted strings treat backslash as an escape character, so a
+    # raw Windows path (e.g. "...\Users\...") interpolated directly here can
+    # crash tomllib -- "\U" in particular is parsed as the start of an
+    # 8-hex-digit unicode escape and raises TOMLDecodeError on whatever
+    # non-hex characters follow it. .as_posix() sidesteps this entirely
+    # (forward slashes need no escaping in TOML, and Windows accepts them
+    # in paths too), rather than only working around it for one temp dir.
     data_dir = tmp_path / "data"
     settings_path = tmp_path / "settings.toml"
     settings_path.write_text(
         textwrap.dedent(
             f"""
             [paths]
-            data_dir = "{data_dir}"
-            tmp_dir = "{tmp_path / 'tmp'}"
-            models_dir = "{tmp_path / 'models'}"
+            data_dir = "{data_dir.as_posix()}"
+            tmp_dir = "{(tmp_path / 'tmp').as_posix()}"
+            models_dir = "{(tmp_path / 'models').as_posix()}"
 
             [llm]
             backend = "llama-server"
@@ -56,12 +63,12 @@ def _write_settings(tmp_path: Path) -> Path:
             tmp_audio_ttl_seconds = 0
 
             [concurrency]
-            lock_path = "{data_dir / 'state' / '.lock'}"
+            lock_path = "{(data_dir / 'state' / '.lock').as_posix()}"
             lock_timeout_seconds = 10
 
             [agent]
             max_iterations = 12
-            trace_dir = "{tmp_path / 'traces'}"
+            trace_dir = "{(tmp_path / 'traces').as_posix()}"
             """
         )
     )

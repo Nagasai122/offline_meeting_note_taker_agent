@@ -25,6 +25,17 @@ heavy dependencies and needs a Hugging Face token for its own model weights):
 pip install -e ".[diarisation]"
 ```
 
+v2 features and their dependencies (all installed by the plain `pip install -e .`
+above — listed here for awareness, not as extra steps):
+
+| Feature | Dependency | Notes |
+|---|---|---|
+| Document context (PDF/PPTX/DOCX upload) | `pdfplumber`, `python-pptx`, `python-docx` | Pure Python, no network at runtime. |
+| Transcript/document upload endpoints | `python-multipart` | Required by FastAPI for multipart form uploads. |
+| Past Meetings / Project Meetings / Seminars search | `rank-bm25` | Pure Python. |
+| Local due-task reminders | `winotify` | Windows only; `cli/reminders.py` degrades to a no-op (logged warning) if not installed. |
+| Mail/calendar context enrichment | `pywin32` (already required) | Needs the local Outlook desktop app open — not a separate install, but genuinely optional at runtime: `cli/mail_sync.py`/`cli/calendar_matcher.py` fail closed (log + continue) if Outlook isn't reachable. |
+
 ## 2. Download a model profile (the one network-permitted step)
 
 This is the **only** command in this tool permitted to make network requests.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import json
 
 import pytest
@@ -19,11 +20,25 @@ def _touch_session_audio(tmp_dir, session_id: str) -> None:
     (tmp_dir / f"{session_id}.json").write_text(json.dumps({"session_id": session_id}))
 
 
-def test_transcribe_audio_missing_dependency_raises_typed_error(tmp_path):
-    """faster-whisper is NOT installed in this sandbox -- a real test of the
-    ImportError-to-TranscriptionError translation, not a mocked one."""
+def test_transcribe_audio_missing_dependency_raises_typed_error(tmp_path, monkeypatch):
+    """Forces the `from faster_whisper import WhisperModel` in transcribe_audio
+    to raise ImportError regardless of whether faster-whisper is actually
+    installed in the interpreter running this test -- a prior version of this
+    test relied on the ambient environment not having it installed, which made
+    it pass or fail based on which Python ran pytest rather than on the code
+    under test."""
     wav_path = tmp_path / "s1.wav"
     wav_path.write_bytes(b"fake")
+
+    real_import = builtins.__import__
+
+    def _blocked_import(name, *args, **kwargs):
+        if name == "faster_whisper":
+            raise ImportError("No module named 'faster_whisper'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked_import)
+
     with pytest.raises(TranscriptionError, match="faster-whisper is not installed"):
         transcribe_audio(wav_path, "s1", model_size="medium", device="cuda", compute_type="int8_float16")
 
