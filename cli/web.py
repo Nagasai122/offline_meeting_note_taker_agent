@@ -474,6 +474,54 @@ async def fetch_mail_context_endpoint(req: MailContextRequest):
     return JSONResponse({"status": "found", "body": body, "preview": body[:100]})
 
 
+@app.post("/api/context/mail-file")
+async def upload_mail_file(file: UploadFile = File(...), session_id: str | None = Form(None)):
+    """Deterministic email context: parse a dragged-and-dropped .eml/.msg file
+    (cli/mail_import.py) instead of fuzzy-matching the Outlook inbox. Same
+    session_id semantics as /api/context/mail: without one, the parsed text is
+    returned for the pre-meeting modal to fold into the agenda notes; with
+    one, it persists as `<session_id>.mail_context.txt`."""
+    from cli.mail_import import (
+        SUPPORTED_MAIL_SUFFIXES, MailParseError, format_mail_context, parse_mail_file,
+    )
+    from cli.mail_sync import save_mail_context
+
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in SUPPORTED_MAIL_SUFFIXES:
+        return JSONResponse(
+            {"error": f"Unsupported file type '{suffix}'. Allowed: {sorted(SUPPORTED_MAIL_SUFFIXES)}"},
+            status_code=400,
+        )
+    if session_id is not None:
+        from mcp_server.schemas import validate_session_id, SchemaValidationError
+        try:
+            validate_session_id(session_id)
+        except SchemaValidationError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=422)
+
+    contents = await file.read()
+    if len(contents) > _MAX_UPLOAD_BYTES:
+        return JSONResponse({"error": "File exceeds 50MB limit."}, status_code=413)
+
+    tmp_dir = Path(settings.paths.tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = tmp_dir / f"mailimport_{datetime.now().strftime('%H%M%S%f')}{suffix}"
+    tmp_path.write_bytes(contents)
+    try:
+        parsed = await asyncio.to_thread(parse_mail_file, tmp_path)
+    except MailParseError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    context_text = format_mail_context(parsed)
+    if session_id:
+        meetings_dir = Path(settings.paths.data_dir) / "meetings"
+        save_mail_context(session_id, meetings_dir, context_text)
+        return JSONResponse({"status": "saved", "subject": parsed["subject"]})
+    return JSONResponse({"status": "parsed", "subject": parsed["subject"], "body": context_text})
+
+
 _SUPPORTED_TRANSCRIPT_SUFFIXES = {".json", ".vtt", ".srt", ".txt"}
 
 

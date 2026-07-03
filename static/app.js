@@ -391,10 +391,16 @@ function closePreMeetingModal() {
 
 function _acceptPreMeetingFile(file) {
     if (!file) return;
-    const allowed = ['.pdf', '.pptx', '.docx', '.txt'];
     const name = file.name.toLowerCase();
+    if (name.endsWith('.eml') || name.endsWith('.msg')) {
+        // Emails are parsed immediately and folded into the agenda notes —
+        // deterministic alternative to the fuzzy "Search Outlook" button.
+        _importDroppedEmail(file);
+        return;
+    }
+    const allowed = ['.pdf', '.pptx', '.docx', '.txt'];
     if (!allowed.some(ext => name.endsWith(ext))) {
-        showFetchError('Unsupported file type. Allowed: PDF, PPTX, DOCX, TXT.');
+        showFetchError('Unsupported file type. Allowed: PDF, PPTX, DOCX, TXT — or an email as .eml/.msg.');
         return;
     }
     if (file.size > 50 * 1024 * 1024) {
@@ -406,6 +412,24 @@ function _acceptPreMeetingFile(file) {
     const el = document.getElementById('pmc-selected-file');
     el.innerHTML = `<i class="fa-solid fa-file"></i> ${escHtml(file.name)} (${sizeKb} KB)`;
     el.classList.remove('hidden');
+}
+
+async function _importDroppedEmail(file) {
+    const statusEl = document.getElementById('pmc-mail-status');
+    const agendaEl = document.getElementById('pmc-agenda');
+    statusEl.textContent = `Parsing ${file.name}…`;
+    try {
+        const fd = new FormData();
+        fd.append('file', file);
+        const resp = await fetch('/api/context/mail-file', { method: 'POST', body: fd });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        const marker = '\n\n--- Dropped email context ---\n';
+        agendaEl.value = agendaEl.value + marker + data.body;
+        statusEl.textContent = `Email "${data.subject || file.name}" added to notes below.`;
+    } catch (e) {
+        statusEl.textContent = 'Email import failed: ' + e.message;
+    }
 }
 
 function handlePreMeetingFileSelect(files) {

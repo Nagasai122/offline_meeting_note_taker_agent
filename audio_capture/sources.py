@@ -151,6 +151,20 @@ class LoopbackSource(AudioSource):
 
     @staticmethod
     def _default_loopback_device_index(pa) -> int:  # noqa: ANN001
+        # Prefer the loopback of the DEFAULT output device: during a
+        # Teams/Zoom call the far side plays through whatever device the user
+        # actually selected (often a headset), and recording the loopback of
+        # some other enumerated device captures silence. Falling back to the
+        # first enumerated loopback keeps older pyaudiowpatch versions working.
+        try:
+            default = pa.get_default_wasapi_loopback()
+            return default["index"]
+        except (AttributeError, OSError, LookupError):
+            logger.warning(
+                "Could not resolve the default output device's loopback; "
+                "falling back to the first enumerated loopback device. If the "
+                "recording is silent, pass --device-index explicitly."
+            )
         for device in pa.get_loopback_device_info_generator():
             return device["index"]
         raise RuntimeError(

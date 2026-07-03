@@ -4,33 +4,31 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Meeting Agent Dashboard</title>
-    <!-- Google Fonts -->
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+    <!-- Google Fonts: Fraunces (display serif, headings), Karla (body), JetBrains Mono (session IDs/timestamps/data) -->
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Karla:wght@400;500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
     <!-- FontAwesome for Icons -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link rel="stylesheet" href="/static/index.css">
 </head>
 <body>
-    <div class="background-orbs">
-        <div class="orb orb-1"></div>
-        <div class="orb orb-2"></div>
-        <div class="orb orb-3"></div>
-    </div>
-    
     <div class="app-container">
         <!-- Sidebar Navigation -->
         <nav class="sidebar glass-panel">
             <div class="logo">
-                <i class="fa-solid fa-robot"></i>
-                <h2>Nemotron</h2>
+                <i class="fa-solid fa-book-open"></i>
+                <h2>Meeting Agent</h2>
             </div>
             <ul class="nav-links" role="tablist">
-                <li id="nav-dashboard" class="active" role="tab" tabindex="0" aria-selected="true" onclick="switchTab('dashboard')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('dashboard');}"><i class="fa-solid fa-house"></i> Dashboard</li>
-                <li id="nav-calendar" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('calendar')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('calendar');}"><i class="fa-solid fa-calendar-days"></i> Calendar</li>
-                <li id="nav-meetings" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('meetings')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('meetings');}"><i class="fa-solid fa-folder-open"></i> Past Meetings</li>
-                <li id="nav-tasks" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('tasks')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('tasks');}"><i class="fa-solid fa-list-check"></i> Tasks</li>
-                <li id="nav-review" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('review')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('review');}"><i class="fa-solid fa-user-check"></i> Needs Review <span id="review-badge" class="badge" style="display:none;background:#f59e0b;"></span></li>
-                <li id="nav-system" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('system')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('system');}"><i class="fa-solid fa-sliders"></i> System</li>
+                <li id="nav-dashboard" data-tab="dashboard" class="active" role="tab" tabindex="0" aria-selected="true" onclick="switchTab('dashboard')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('dashboard');}"><i class="fa-solid fa-house"></i> Dashboard</li>
+                <li id="nav-is-call-hub" data-tab="is-call-hub" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('is-call-hub')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('is-call-hub');}"><i class="fa-solid fa-phone-volume"></i> IS Call Hub</li>
+                <li id="nav-project-meetings" data-tab="project-meetings" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('project-meetings')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('project-meetings');}"><i class="fa-solid fa-diagram-project"></i> Project Meetings</li>
+                <li id="nav-seminars" data-tab="seminars" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('seminars')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('seminars');}"><i class="fa-solid fa-chalkboard-user"></i> Seminars</li>
+                <li id="nav-calendar" data-tab="calendar" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('calendar')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('calendar');}"><i class="fa-solid fa-calendar-days"></i> Calendar</li>
+                <li id="nav-meetings" data-tab="meetings" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('meetings')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('meetings');}"><i class="fa-solid fa-folder-open"></i> Past Meetings</li>
+                <li id="nav-tasks" data-tab="tasks" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('tasks')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('tasks');}"><i class="fa-solid fa-list-check"></i> Tasks</li>
+                <li id="nav-review" data-tab="review" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('review')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('review');}"><i class="fa-solid fa-user-check"></i> Needs Review <span id="review-badge" class="badge" style="display:none;background:#b8862e;"></span></li>
+                <li id="nav-settings" data-tab="settings" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('settings')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('settings');}"><i class="fa-solid fa-gear"></i> Settings</li>
+                <li id="nav-system" data-tab="system" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('system')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('system');}"><i class="fa-solid fa-sliders"></i> System</li>
             </ul>
             <div class="system-status">
                 <span class="status-indicator"></span>
@@ -44,16 +42,29 @@
             <header class="top-bar">
                 <div class="greeting">
                     <h1 id="greeting-text">Good morning.</h1>
-                    <p>Here is your daily briefing.</p>
+                    <p>Here is your daily briefing.
+                        <button class="btn-icon" title="Generate weekly digest" aria-label="Generate weekly digest"
+                                style="margin-left:0.5rem;" onclick="openWeeklyDigest()">
+                            <i class="fa-solid fa-chart-simple"></i>
+                        </button>
+                    </p>
                 </div>
                 <div class="recording-controls glass-panel">
                     <div id="recording-status" class="recording-idle" style="display: flex; align-items: center; gap: 10px; width: 100%;">
                         <i class="fa-solid fa-microphone"></i>
                         <span id="recording-status-text">Ready to Record</span>
+                        <span id="recording-elapsed" class="hidden" style="font-family:'JetBrains Mono',monospace;color:var(--text-muted);"></span>
                     </div>
                     <div id="pre-meeting-controls" style="width: 100%; margin-top: 10px;">
+                        <label for="meeting-type-select" class="sr-only">Meeting type</label>
+                        <select id="meeting-type-select" aria-label="Meeting type" class="select-input" style="margin-bottom: 8px;">
+                            <option value="general" selected>General / Other</option>
+                            <option value="project-meeting">Project Meeting</option>
+                            <option value="is-call">IS Call (ad-hoc)</option>
+                            <option value="seminar">Seminar</option>
+                        </select>
                         <label for="meeting-context" class="sr-only">Meeting agenda or context</label>
-                        <textarea id="meeting-context" aria-label="Meeting agenda or context" placeholder="Optional: Meeting agenda or context (e.g. 1:1 sync with John)" rows="2" style="width: 100%; padding: 8px; border-radius: 5px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.2); color: white;"></textarea>
+                        <textarea id="meeting-context" aria-label="Meeting agenda or context" placeholder="Optional: Meeting agenda or context (e.g. 1:1 sync with John)" rows="2" style="width: 100%; padding: 8px; border-radius: 3px; border: 1px solid var(--hairline-strong); background: var(--card-raised); color: var(--ink);"></textarea>
                     </div>
                     <div style="display: flex; gap: 10px; margin-top: 10px;">
                         <button id="btn-toggle-record" class="btn-primary" style="flex: 1;">
@@ -66,28 +77,39 @@
                 </div>
             </header>
             
+            <div id="due-alert-cards"></div>
+
             <div id="live-transcript-panel" class="glass-panel hidden" style="margin-bottom: 2rem;">
                 <h3 style="margin-bottom: 10px; color: var(--accent);">
                     <i class="fa-solid fa-satellite-dish fa-fade"></i> Live Transcription
-                    <span id="live-source-badge" style="font-size:0.75rem;font-weight:400;margin-left:0.75rem;padding:2px 8px;border-radius:12px;background:rgba(255,255,255,0.1);color:var(--text-muted);"></span>
+                    <span id="live-source-badge" style="font-size:0.75rem;font-weight:400;margin-left:0.75rem;padding:2px 8px;border-radius:12px;background:rgba(43,42,40,0.06);color:var(--text-muted);"></span>
                 </h3>
-                <div id="live-transcript-text" style="max-height: 150px; overflow-y: auto; font-family: monospace; color: var(--text-muted); padding: 10px; background: rgba(0,0,0,0.3); border-radius: 5px;">
+                <div id="live-transcript-text" style="max-height: 150px; overflow-y: auto; font-family: monospace; color: var(--text-muted); padding: 10px; background: var(--desk); border-radius: 3px;">
                     Starting...
                 </div>
             </div>
 
             <div id="processing-banner" class="glass-panel hidden">
-                <i class="fa-solid fa-microchip fa-spin"></i>
-                <div>
-                    <h3>Processing...</h3>
-                    <p style="color: var(--text-muted); font-size: 0.9rem;">The AI is generating your notes. This usually takes a minute or two.</p>
+                <i id="processing-icon" class="fa-solid fa-microchip fa-spin"></i>
+                <div style="flex:1;">
+                    <h3 id="processing-title">Processing...</h3>
+                    <p id="processing-detail" style="color: var(--text-muted); font-size: 0.9rem; margin: 0.2rem 0 0.5rem;"></p>
+                    <div id="pipeline-steps" style="display:flex; gap:0.4rem; flex-wrap:wrap; align-items:center; font-size:0.82rem;">
+                        <span class="pipeline-step" data-step="TRANSCRIBING">① Transcribing</span>
+                        <span style="color:var(--text-muted);">→</span>
+                        <span class="pipeline-step" data-step="LLM_LOADING">② LLM Loading</span>
+                        <span style="color:var(--text-muted);">→</span>
+                        <span class="pipeline-step" data-step="EXTRACTING">③ Extracting</span>
+                        <span style="color:var(--text-muted);">→</span>
+                        <span class="pipeline-step" data-step="AWAITING_REVIEW">④ Ready for Review</span>
+                    </div>
                 </div>
             </div>
 
-            <div id="error-banner" class="glass-panel hidden" style="background: rgba(239, 68, 68, 0.2); border-left: 4px solid #ef4444;">
-                <i class="fa-solid fa-triangle-exclamation" style="color: #ef4444; font-size: 2rem;"></i>
+            <div id="error-banner" class="glass-panel hidden" style="background: rgba(166, 67, 45, 0.12); border-left: 4px solid #a6432d;">
+                <i class="fa-solid fa-triangle-exclamation" style="color: #a6432d; font-size: 2rem;"></i>
                 <div>
-                    <h3 style="color: #ef4444;">Processing Failed</h3>
+                    <h3 style="color: #a6432d;">Processing Failed</h3>
                     <p id="error-text" style="color: var(--text-muted); font-size: 0.9rem; font-family: monospace;"></p>
                 </div>
             </div>
@@ -134,6 +156,53 @@
                 </section>
             </div>
             
+            <!-- IS Call Hub: the critical daily-use path. One-tap start, no title
+                 prompt, chained history. -->
+            <div id="view-is-call-hub" class="hidden">
+                <section class="card glass-panel hub-hero">
+                    <h2><i class="fa-solid fa-phone-volume" style="color: var(--primary);"></i> IS Call Hub</h2>
+                    <p>One tap starts recording immediately with a chained <code>is-call-*</code> session — no title prompt, no pre-meeting context modal.</p>
+                    <button id="btn-start-is-call" class="btn-primary btn-hero" onclick="startIsCall()">
+                        <i class="fa-solid fa-microphone"></i> Start IS Call
+                    </button>
+                </section>
+
+                <div class="dashboard-grid" style="margin-top: 1.5rem;">
+                    <section class="widget glass-panel">
+                        <div class="widget-header">
+                            <h3><i class="fa-solid fa-clock-rotate-left"></i> Yesterday's Targets</h3>
+                        </div>
+                        <div class="widget-body" id="is-call-yesterday-targets">
+                            <div class="empty-state">No prior IS call found.</div>
+                        </div>
+                    </section>
+                    <section class="widget glass-panel">
+                        <div class="widget-header">
+                            <h3><i class="fa-solid fa-chart-line"></i> Today's Progress</h3>
+                        </div>
+                        <div class="widget-body" id="is-call-today-progress">
+                            <div class="empty-state">No IS call completed today yet.</div>
+                        </div>
+                    </section>
+                </div>
+
+                <section class="card glass-panel" id="recurring-blockers-card" style="margin-top: 1.5rem; display:none;">
+                    <div class="card-header">
+                        <h2><i class="fa-solid fa-triangle-exclamation" style="color:#b8862e;"></i> Recurring Blockers</h2>
+                    </div>
+                    <div id="recurring-blockers-list"></div>
+                </section>
+
+                <section class="card glass-panel" style="margin-top: 1.5rem;">
+                    <div class="card-header">
+                        <h2><i class="fa-solid fa-list"></i> Call History</h2>
+                    </div>
+                    <div id="is-call-history-list" style="display:flex;flex-direction:column;gap:0.75rem;">
+                        <p style="color: var(--text-muted);">Loading history…</p>
+                    </div>
+                </section>
+            </div>
+
             <div id="view-calendar" class="hidden">
                 <section class="card glass-panel">
                     <div class="card-header">
@@ -157,9 +226,9 @@
                             <input type="search" id="meetings-search"
                                    placeholder="Search meetings by keyword…"
                                    aria-label="Search past meetings"
-                                   style="width:100%;padding:10px 12px 10px 36px;background:rgba(0,0,0,0.3);
-                                          border:1px solid rgba(255,255,255,0.15);border-radius:8px;
-                                          color:white;font-size:0.95rem;box-sizing:border-box;"
+                                   style="width:100%;padding:10px 12px 10px 36px;background:var(--card-raised);
+                                          border:1px solid var(--hairline-strong);border-radius:3px;
+                                          color:var(--ink);font-size:0.95rem;box-sizing:border-box;"
                                    oninput="debouncedSearch(this.value)">
                         </div>
                         <div id="search-results" style="display:none;margin-top:0.75rem;"></div>
@@ -169,7 +238,29 @@
                     </div>
                 </section>
             </div>
-            
+
+            <div id="view-project-meetings" class="hidden">
+                <section class="card glass-panel">
+                    <div class="card-header">
+                        <h2><i class="fa-solid fa-diagram-project" style="color: var(--primary);"></i> Project Meetings</h2>
+                    </div>
+                    <div id="project-meetings-list" style="display: flex; flex-direction: column; gap: 15px;">
+                        <p style="color: var(--text-muted);">Loading…</p>
+                    </div>
+                </section>
+            </div>
+
+            <div id="view-seminars" class="hidden">
+                <section class="card glass-panel">
+                    <div class="card-header">
+                        <h2><i class="fa-solid fa-chalkboard-user" style="color: var(--primary);"></i> Seminars</h2>
+                    </div>
+                    <div id="seminars-list" style="display: flex; flex-direction: column; gap: 15px;">
+                        <p style="color: var(--text-muted);">Loading…</p>
+                    </div>
+                </section>
+            </div>
+
             <!-- Needs Review view -->
             <div id="view-review" class="hidden">
                 <section class="card glass-panel">
@@ -188,7 +279,7 @@
 
                     <!-- Awaiting Apply -->
                     <div id="review-apply-section">
-                        <h3 style="margin:1.5rem 0 0.75rem;color:#10b981;">
+                        <h3 style="margin:1.5rem 0 0.75rem;color:#33513e;">
                             <i class="fa-solid fa-circle-check"></i> Reviewed — Ready to Apply
                         </h3>
                         <div id="review-apply-list"></div>
@@ -231,7 +322,7 @@
                             The page will automatically reload once the server is back.
                         </p>
                         <button class="btn-primary" onclick="restartWebServer()"
-                                style="background:linear-gradient(135deg,#f59e0b,#d97706);">
+                                style="background:#b8862e;">
                             <i class="fa-solid fa-rotate-right"></i> Restart Dashboard
                         </button>
                         <span id="restart-status" style="margin-left:1rem;font-size:0.85rem;color:var(--text-muted);"></span>
@@ -246,11 +337,11 @@
                         </p>
                         <div style="display:flex;gap:0.75rem;flex-wrap:wrap;">
                             <button class="btn-primary" onclick="llmStart()"
-                                    style="background:linear-gradient(135deg,#10b981,#059669);">
+                                    style="background:#33513e;">
                                 <i class="fa-solid fa-play"></i> Start LLM Server
                             </button>
                             <button class="btn-primary" onclick="llmStop()"
-                                    style="background:linear-gradient(135deg,#ef4444,#dc2626);">
+                                    style="background:#a6432d;">
                                 <i class="fa-solid fa-stop"></i> Stop LLM Server
                             </button>
                         </div>
@@ -258,14 +349,14 @@
                     </div>
 
                     <!-- Data reset -->
-                    <div class="glass-panel" style="padding:1.2rem;border:1px solid rgba(239,68,68,0.3);">
-                        <h3 style="margin:0 0 0.8rem;font-size:1rem;color:#f87171;"><i class="fa-solid fa-trash"></i> Reset All Data</h3>
+                    <div class="glass-panel" style="padding:1.2rem;border:1px solid rgba(166,67,45,0.3);">
+                        <h3 style="margin:0 0 0.8rem;font-size:1rem;color:#a6432d;"><i class="fa-solid fa-trash"></i> Reset All Data</h3>
                         <p style="font-size:0.85rem;color:var(--text-muted);margin-bottom:1rem;">
                             Delete all meeting records, session state, pending reviews, and clear todo.md.
-                            <strong style="color:#f87171;">This cannot be undone.</strong>
+                            <strong style="color:#a6432d;">This cannot be undone.</strong>
                         </p>
                         <button class="btn-primary" onclick="confirmResetData()"
-                                style="background:linear-gradient(135deg,#ef4444,#b91c1c);">
+                                style="background:#a6432d;">
                             <i class="fa-solid fa-trash-can"></i> Reset All Data
                         </button>
                         <span id="reset-status" style="margin-left:1rem;font-size:0.85rem;color:var(--text-muted);"></span>
@@ -279,13 +370,147 @@
                         <h2><i class="fa-solid fa-list-check" style="color: var(--primary);"></i> All Action Items</h2>
                         <span class="badge" id="full-task-count">0</span>
                     </div>
+
+                    <button id="btn-toggle-add-task" class="btn-secondary" style="margin-bottom: 1rem;" onclick="toggleAddTaskForm()">
+                        <i class="fa-solid fa-plus"></i> Add Task
+                    </button>
+
+                    <div id="add-task-form" class="hidden glass-panel" style="padding: 1.25rem; margin-bottom: 1.25rem;">
+                        <div class="form-row">
+                            <label class="field-label" for="new-task-description">Description</label>
+                            <textarea id="new-task-description" class="textarea-input" rows="2" maxlength="500"
+                                      placeholder="What needs to be done?" oninput="_validateAddTaskForm()"></textarea>
+                        </div>
+                        <div style="display:flex; gap:1rem; flex-wrap:wrap;">
+                            <div class="form-row" style="flex:1; min-width:140px;">
+                                <label class="field-label" for="new-task-due">Due date</label>
+                                <input type="date" id="new-task-due" class="text-input">
+                            </div>
+                            <div class="form-row" style="flex:1; min-width:140px;">
+                                <label class="field-label" for="new-task-priority">Priority</label>
+                                <select id="new-task-priority" class="select-input">
+                                    <option value="HIGH">High</option>
+                                    <option value="MEDIUM" selected>Medium</option>
+                                    <option value="LOW">Low</option>
+                                </select>
+                            </div>
+                            <div class="form-row" style="flex:1; min-width:140px;">
+                                <label class="field-label" for="new-task-tag">Tag</label>
+                                <input type="text" id="new-task-tag" class="text-input" maxlength="50" placeholder="e.g. WP3">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <label class="field-label" for="new-task-note">Progress note (optional)</label>
+                            <input type="text" id="new-task-note" class="text-input" maxlength="200">
+                        </div>
+                        <div id="add-task-error" style="color:#a6432d; font-size:0.85rem; margin-bottom:0.5rem;"></div>
+                        <div class="form-actions">
+                            <button id="btn-save-task" class="btn-primary" disabled onclick="saveManualTask()">Save Task</button>
+                            <button class="btn-secondary" onclick="toggleAddTaskForm(false)">Cancel</button>
+                        </div>
+                    </div>
+
+                    <div class="filter-bar" role="tablist" aria-label="Filter tasks">
+                        <button class="filter-btn active" data-filter="all" role="tab" aria-selected="true" onclick="setTaskFilter('all')">All</button>
+                        <button class="filter-btn" data-filter="active" role="tab" aria-selected="false" onclick="setTaskFilter('active')">Active</button>
+                        <button class="filter-btn" data-filter="blocked" role="tab" aria-selected="false" onclick="setTaskFilter('blocked')">Blocked</button>
+                        <button class="filter-btn" data-filter="done" role="tab" aria-selected="false" onclick="setTaskFilter('done')">Done</button>
+                    </div>
+
                     <div class="widget-body" id="full-task-list">
                         <!-- Populated by JS -->
                         <div class="loading-shimmer"></div>
                     </div>
                 </section>
             </div>
-            
+
+            <div id="view-settings" class="hidden">
+                <section class="card glass-panel">
+                    <div class="card-header">
+                        <h2><i class="fa-solid fa-gear" style="color: var(--primary);"></i> Settings</h2>
+                    </div>
+
+                    <div class="glass-panel" style="padding: 1.2rem; margin-bottom: 1rem;">
+                        <h3 style="margin: 0 0 0.8rem; font-size: 1rem;">Default Whisper Model</h3>
+                        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem;">
+                            Applies to new recordings unless overridden per-session. Larger models are more accurate
+                            but slower and use more VRAM.
+                        </p>
+                        <div class="radio-group" id="whisper-model-radios">
+                            <label class="radio-option">
+                                <input type="radio" name="whisper-model" value="base"> Fast (base) — ~10× real-time, ~8% WER
+                            </label>
+                            <label class="radio-option">
+                                <input type="radio" name="whisper-model" value="small"> Balanced (small) — ~6× real-time, ~5% WER
+                            </label>
+                            <label class="radio-option">
+                                <input type="radio" name="whisper-model" value="large-v3"> Accurate (large-v3) — ~2× real-time, ~2.5% WER
+                            </label>
+                        </div>
+                        <button class="btn-primary" style="margin-top: 1rem;" onclick="saveSettings()">Save</button>
+                        <span id="settings-save-status" style="margin-left: 1rem; font-size: 0.85rem; color: var(--text-muted);"></span>
+                    </div>
+
+                    <div class="glass-panel" style="padding: 1.2rem; margin-bottom: 1rem;">
+                        <h3 style="margin: 0 0 0.8rem; font-size: 1rem;"><i class="fa-solid fa-file-import"></i> Import Transcript</h3>
+                        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem;">
+                            Inject an externally-produced transcript (.txt, .vtt, .srt, or Whisper .json) directly at
+                            TRANSCRIBED, bypassing recording entirely.
+                        </p>
+
+                        <div class="form-row">
+                            <label class="field-label" for="import-file-input">Transcript file</label>
+                            <input type="file" id="import-file-input" class="text-input" accept=".txt,.vtt,.srt,.json">
+                        </div>
+
+                        <div style="display:flex; gap:1rem; flex-wrap:wrap;">
+                            <div class="form-row" style="flex:1; min-width:160px;">
+                                <label class="field-label" for="import-type-select">Meeting type</label>
+                                <select id="import-type-select" class="select-input">
+                                    <option value="general" selected>General / Other</option>
+                                    <option value="project-meeting">Project Meeting</option>
+                                    <option value="is-call">IS Call</option>
+                                    <option value="seminar">Seminar</option>
+                                </select>
+                            </div>
+                            <div class="form-row" style="flex:1; min-width:160px;">
+                                <label class="field-label" for="import-session-id">Session ID (optional)</label>
+                                <input type="text" id="import-session-id" class="text-input" placeholder="Auto-generated if blank">
+                            </div>
+                        </div>
+
+                        <div class="form-row glass-panel" style="padding:0.9rem;">
+                            <label class="field-label" style="margin-bottom:0.6rem;">Link to calendar meeting (optional)</label>
+                            <div style="display:flex; gap:0.75rem; flex-wrap:wrap; align-items:flex-end;">
+                                <div style="flex:1; min-width:150px;">
+                                    <label class="field-label" for="import-cal-date">Meeting date</label>
+                                    <input type="date" id="import-cal-date" class="text-input">
+                                </div>
+                                <button class="btn-secondary" onclick="searchImportCalendarEvents()">Search</button>
+                            </div>
+                            <div id="import-cal-results" style="margin-top:0.75rem;"></div>
+                            <div id="import-cal-selected" style="margin-top:0.5rem; font-size:0.85rem; color:var(--pine-deep);"></div>
+                        </div>
+
+                        <div id="import-error" style="color:#a6432d; font-size:0.85rem; margin-bottom:0.5rem;"></div>
+                        <button id="import-transcript-btn" class="btn-primary" onclick="submitTranscriptImport()">
+                            <i class="fa-solid fa-upload"></i> Import Transcript
+                        </button>
+                        <span id="import-status" style="margin-left:1rem; font-size:0.85rem; color:var(--text-muted);"></span>
+                    </div>
+
+                    <div class="glass-panel" style="padding: 1.2rem;">
+                        <h3 style="margin: 0 0 0.8rem; font-size: 1rem;"><i class="fa-solid fa-shield-halved"></i> Privacy Notice — Mail Context</h3>
+                        <p style="font-size: 0.85rem; color: var(--text-muted);">
+                            When you use "Fetch mail context" before a meeting, the matched email body is stored only
+                            locally in <code>data/meetings/&lt;session&gt;.mail_context.txt</code>. It is never uploaded
+                            or transmitted anywhere, and is subject to the same cleanup rules as other session
+                            artefacts if a session fails before being applied.
+                        </p>
+                    </div>
+                </section>
+            </div>
+
         </main>
     </div>
 
@@ -293,28 +518,38 @@
     <div id="meeting-detail-modal"
          role="dialog" aria-modal="true" aria-labelledby="modal-session-title"
          style="display:none;position:fixed;inset:0;z-index:1000;
-                background:rgba(0,0,0,0.75);overflow-y:auto;padding:2rem 1rem;">
-        <div style="max-width:860px;margin:0 auto;background:#1e1e2e;border-radius:12px;
-                    border:1px solid rgba(255,255,255,0.12);padding:1.5rem;position:relative;">
+                background:rgba(43,42,40,0.45);overflow-y:auto;padding:2rem 1rem;">
+        <div style="max-width:860px;margin:0 auto;background:var(--card);border-radius:4px;
+                    border:1px solid var(--hairline-strong);box-shadow:6px 6px 0 rgba(43,42,40,0.15);
+                    padding:1.5rem;position:relative;">
             <button onclick="closeMeetingDetail()" aria-label="Close"
                     style="position:absolute;top:1rem;right:1rem;background:none;border:none;
                            color:var(--text-muted);font-size:1.4rem;cursor:pointer;">&#x2715;</button>
             <h2 id="modal-session-title" style="color:var(--primary);margin-bottom:1rem;"></h2>
 
+            <div id="modal-calendar-link" style="display:none;margin-bottom:1rem;font-size:0.85rem;color:var(--pine-deep);"></div>
+
+            <div id="modal-mom" style="display:none;margin-bottom:1.5rem;">
+                <h3 style="color:var(--accent);margin-bottom:0.5rem;">Minutes of Meeting</h3>
+                <!-- Rendered as preformatted text, never through innerHTML markdown parsing --
+                     keeps this safe from XSS the same way modal-summary-body/modal-transcript-body are. -->
+                <pre id="modal-mom-body" class="mom-pre"></pre>
+            </div>
+
             <div id="modal-summary" style="display:none;margin-bottom:1.5rem;">
                 <h3 style="color:var(--accent);margin-bottom:0.5rem;">Summary</h3>
                 <div id="modal-summary-body"
-                     style="background:rgba(0,0,0,0.3);border-radius:8px;padding:1rem;
+                     style="background:var(--desk);border-radius:4px;padding:1rem;
                             white-space:pre-wrap;font-size:0.9rem;color:var(--text-muted);"></div>
             </div>
 
             <div id="modal-actions" style="display:none;margin-bottom:1.5rem;">
-                <h3 style="color:#10b981;margin-bottom:0.5rem;">Action Items</h3>
+                <h3 style="color:#33513e;margin-bottom:0.5rem;">Action Items</h3>
                 <ul id="modal-actions-list" style="list-style:none;padding:0;margin:0;"></ul>
             </div>
 
             <div id="modal-highlights" style="display:none;margin-bottom:1.5rem;">
-                <h3 style="color:#f59e0b;margin-bottom:0.5rem;">Highlights</h3>
+                <h3 style="color:#b8862e;margin-bottom:0.5rem;">Highlights</h3>
                 <ul id="modal-highlights-list" style="list-style:none;padding:0;margin:0;"></ul>
             </div>
 
@@ -323,13 +558,80 @@
                     Full Transcript
                     <button onclick="toggleTranscript()" id="btn-toggle-transcript"
                             style="font-size:0.75rem;margin-left:0.5rem;padding:2px 8px;
-                                   background:rgba(255,255,255,0.1);border:none;border-radius:4px;
+                                   background:rgba(43,42,40,0.06);border:none;border-radius:4px;
                                    color:var(--text-muted);cursor:pointer;">show</button>
                 </h3>
                 <div id="modal-transcript-body"
-                     style="display:none;background:rgba(0,0,0,0.3);border-radius:8px;padding:1rem;
+                     style="display:none;background:var(--desk);border-radius:4px;padding:1rem;
                             white-space:pre-wrap;font-size:0.82rem;color:var(--text-muted);
                             max-height:400px;overflow-y:auto;font-family:monospace;"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Weekly Digest modal: user-initiated only, never auto-run. -->
+    <div id="weekly-digest-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="wd-title">
+        <div class="modal-box" style="max-width: 640px;">
+            <button class="modal-close-btn" aria-label="Close" onclick="closeWeeklyDigest()">&#x2715;</button>
+            <h2 id="wd-title" style="color:var(--primary);margin-bottom:1rem;"><i class="fa-solid fa-chart-simple"></i> Weekly Digest</h2>
+            <div id="weekly-digest-body" style="font-size:0.9rem;line-height:1.6;">
+                <p style="color:var(--text-muted);">Generating…</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Pre-meeting context modal: shown before starting a Project Meeting or
+         Seminar (never for the IS Call Hub's one-tap flow). -->
+    <div id="pre-meeting-context-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="pmc-title">
+        <div class="modal-box">
+            <button class="modal-close-btn" aria-label="Cancel and close" onclick="closePreMeetingModal()">&#x2715;</button>
+            <h2 id="pmc-title" style="color:var(--primary);margin-bottom:0.25rem;">Pre-Meeting Context</h2>
+            <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:1.25rem;">
+                Only the title is required — the document, mail context, and agenda notes
+                below are all optional.
+            </p>
+
+            <div class="form-row">
+                <label class="field-label" for="pmc-title-input">Meeting Title</label>
+                <input type="text" id="pmc-title-input" class="text-input" maxlength="100"
+                       placeholder="e.g. Kickoff call with Acme Corp" oninput="_validatePreMeetingForm()">
+            </div>
+
+            <div id="pmc-error" style="color:#a6432d;font-size:0.85rem;margin-bottom:0.75rem;"></div>
+
+            <div class="form-row">
+                <label class="field-label" id="pmc-dropzone-label">Document or email (optional — PDF, PPTX, DOCX, TXT, or a dragged email as EML/MSG, max 50MB)</label>
+                <div id="pmc-dropzone" class="drop-zone" tabindex="0" role="button"
+                     aria-labelledby="pmc-dropzone-label"
+                     onclick="document.getElementById('pmc-file-input').click()"
+                     onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();document.getElementById('pmc-file-input').click();}"
+                     ondragover="event.preventDefault();this.classList.add('dragover');"
+                     ondragleave="this.classList.remove('dragover');"
+                     ondrop="handlePreMeetingFileDrop(event)">
+                    <i class="fa-solid fa-cloud-arrow-up"></i>
+                    <div>Drop a document or an email (.eml/.msg) here, or click to browse</div>
+                    <input type="file" id="pmc-file-input" class="sr-only" accept=".pdf,.pptx,.docx,.txt,.eml,.msg"
+                           onchange="handlePreMeetingFileSelect(this.files)">
+                </div>
+                <div id="pmc-selected-file" class="drop-zone-file hidden"></div>
+            </div>
+
+            <div class="form-row">
+                <label class="field-label" for="pmc-agenda">Agenda / Notes (optional)</label>
+                <textarea id="pmc-agenda" class="textarea-input" rows="3" maxlength="1000"
+                          placeholder="Optional free-text agenda or notes for this meeting"></textarea>
+            </div>
+
+            <div class="form-row">
+                <button class="btn-secondary" onclick="fetchPreMeetingMailContext()"><i class="fa-solid fa-envelope"></i> Fetch mail context for this meeting (optional)</button>
+                <div id="pmc-mail-status" style="margin-top:0.5rem;font-size:0.85rem;color:var(--text-muted);"></div>
+            </div>
+
+            <div class="form-actions">
+                <button id="pmc-start-btn" class="btn-primary" disabled onclick="startRecordingFromPreMeetingModal()">
+                    <i class="fa-solid fa-microphone"></i> Start Recording
+                </button>
+                <button class="btn-secondary" onclick="closePreMeetingModal()">Cancel</button>
             </div>
         </div>
     </div>
