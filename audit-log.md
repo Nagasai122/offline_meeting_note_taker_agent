@@ -411,3 +411,66 @@ after the meeting ends* — latency the user never sits in front of.
 **Strand D acceptance criteria:** baselines recorded — MET;
 chunking-efficiency finding documented — MET; backend recommendation
 produced, not implemented — MET (awaiting [HUMAN DECISION]).
+
+---
+
+## Strand F — Frontend/UX audit and containerisation
+
+### Plan (written before execution)
+
+1. Sweep every fetch/render path in static/app.js for loading/empty/error
+   handling across IS Call Hub, Project Meetings/Seminars, Needs Review,
+   Tasks, Calendar, Settings, Import.
+2. UI-layer parity: confirm the dashboard drives the same endpoints the
+   Strand C parity suite pinned against the CLI.
+3. Produce Dockerfile + compose with GPU passthrough, healthchecks, and an
+   independently-enforced egress-denying network policy.
+
+### Findings (2026-07-03)
+
+**F-1. Frontend failure-state sweep — materially better than the 2026-07-01
+review's snapshot.** All 38 fetch sites audited: review queue, search,
+meeting detail, IS hub history, weekly digest, tasks, settings-save, import
+and system views all render explicit error/empty states (`showFetchError`
+banner or inline red text; empty-state copy present for calendar/tasks/
+review lists). Deliberate silent catches are justified where found
+(status poll during server restart; best-effort doc-context upload;
+optional recurring-blockers card hiding itself).
+
+**F-2 (MEDIUM, fixed): the one systemic gap — a dead backend left the
+whole dashboard shimmering forever.** `fetchBriefing` (the 5s poll feeding
+Dashboard/Calendar/Tasks) caught failures to console only; on a backend
+that is down at page-load, every widget kept its initial loading shimmer
+with no error. Now: after 2 consecutive failures the error banner is
+raised, still-shimmering widgets get an explicit "Backend unreachable"
+state, and both clear on recovery. (JS-only change; no endpoint changes.)
+
+**F-3. Known-open UX items re-confirmed as open, not regressed (excluded
+from fresh findings per Strand B rule):** native `alert()`s
+(already-recording guard), no Apply confirmation dialog, no bulk
+accept/reject, diarisation still settings-only.
+
+**F-4. UI-layer parity:** the dashboard's review/apply flow posts to
+`/api/review/decide` + `/api/review/apply` — the exact endpoints the
+Strand C parity suite proved equivalent to the CLI path, including
+refusal behaviour. No UI-side divergence possible (no third write path
+exists in app.js — verified by grep for fetch targets).
+
+**F-5. Containerisation delivered (`deploy/`):** Dockerfile.app (CUDA
+runtime, healthcheck on /api/briefing), docker-compose.yml (llama.cpp
+CUDA server with /health healthcheck + GPU reservation; app service
+publishing 127.0.0.1:8000 only; one-off `setup` profile service that is
+the sole egress-capable path and also pre-fetches the Whisper model —
+closing A-5.3 in container mode), settings.container.toml, README.md.
+**Egress policy independent of the app:** `agent-net` is `internal: true`
+(no default route off the bridge) with a documented verification
+procedure. `docker compose config` validates clean.
+Honest limitations documented: live WASAPI capture stays on the host;
+the two-service app↔llm wiring needs a maintainer-approved change
+(`start_server`'s loopback guard correctly rejects the `llm` service
+hostname today) — single-host mode works with zero code changes.
+
+**Strand F acceptance criteria:** no unhandled loading/empty/error state —
+MET (F-1/F-2); container egress policy independently enforced — MET
+(internal network + verification steps); healthchecks present for both
+LLM and app/transcription containers — MET.

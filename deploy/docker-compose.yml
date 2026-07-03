@@ -1,0 +1,100 @@
+# meeting-agent containerised deployment (audit Strand F).
+#
+# Zero-egress enforcement is INDEPENDENT of the application-level guarantee:
+# the runtime services sit on an `internal: true` network, which Docker
+# implements with no default route off the bridge -- even a compromised or
+# misconfigured process inside the container cannot reach the internet.
+# The dashboard is published on 127.0.0.1 only, matching the app's own
+# loopback-bind policy.
+#
+# The ONE network-permitted step (model download, `meeting-agent setup`) is a
+# separate one-off service on the default (egress-capable) network, run
+# explicitly and never left running:
+#     docker compose --profile setup run --rm setup
+#
+# Known limitation, stated plainly: live audio capture (WASAPI loopback /
+# microphone) is a host-hardware concern and is NOT containerised -- inside
+# containers this stack serves the import-transcript workflow, the LLM
+# server, transcription of uploaded audio, and the review/apply dashboard.
+
+services:
+  llm:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    command: >
+      --model /models/Qwen/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q4_k_m.gguf
+      --host 0.0.0.0 --port 8080 --ctx-size 8192 --n-gpu-layers 999
+    # 0.0.0.0 here binds inside the container's network namespace only; the
+    # port is NOT published to the host, and `agent-net` is internal-only.
+    volumes:
+      - ../models:/models:ro
+    networks: [agent-net]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 120s   # cold-loading a multi-GB GGUF + CUDA init
+      retries: 12
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.app
+    depends_on:
+      llm:
+        condition: service_healthy
+    environment:
+      # Point the app at the llm service instead of localhost. NOTE: requires
+      # settings.toml's [llm] host to be overridable via MEETING_AGENT_LLM_HOST
+      # or a mounted settings file -- mount a container-specific settings.toml:
+      - HF_HUB_OFFLINE=1
+    volumes:
+      - ../data:/app/data
+      - ../models:/app/models:ro
+      - ./settings.container.toml:/app/config/settings.toml:ro
+      - whisper-cache:/root/.cache/huggingface
+    ports:
+      - "127.0.0.1:8000:8000"   # loopback-only publish, same policy as bare-metal
+    networks: [agent-net]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # One-off, explicitly network-permitted model download (the containerised
+  # equivalent of `meeting-agent setup`). Lives on the default egress-capable
+  # network, runs, exits. Also pre-fetches the configured faster-whisper model
+  # into the shared cache volume so first transcription works fully offline.
+  setup:
+    profiles: [setup]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.app
+    entrypoint: >
+      sh -c "pip install huggingface_hub &&
+             python -m cli.main setup --profile qwen2_5_7b_gguf --models-dir /app/models &&
+             python -c \"import os; os.environ.pop('HF_HUB_OFFLINE', None); from faster_whisper import WhisperModel; WhisperModel('base', device='cpu', compute_type='int8')\""
+    environment:
+      - HF_HUB_OFFLINE=0
+    volumes:
+      - ../models:/app/models
+      - whisper-cache:/root/.cache/huggingface
+    networks: [default]
+
+networks:
+  agent-net:
+    internal: true   # <- the defence-in-depth egress wall: no route out, ever
+
+volumes:
+  whisper-cache:

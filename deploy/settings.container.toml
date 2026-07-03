@@ -1,0 +1,42 @@
+# Container-specific settings, mounted over config/settings.toml by
+# deploy/docker-compose.yml. Differences from the bare-metal file:
+#   - llm.host points at the `llm` compose service, not 127.0.0.1;
+#   - llm.serve is externally managed (the llm container), so the web
+#     pipeline's "already running" port probe will always succeed.
+# Everything else mirrors config/settings.toml.
+
+[paths]
+data_dir = "data"
+tmp_dir = "tmp"
+models_dir = "models"
+
+[llm]
+backend = "llama-server"
+active_profile = "qwen2_5_7b_gguf"
+host = "llm"                      # compose service name on the internal-only network
+port = 8080
+startup_timeout_seconds = 300
+health_check_path = "/health"
+
+[whisper]
+model = "base"
+device = "cuda"
+compute_type = "int8_float16"
+diarisation_enabled = false
+
+[privacy]
+disable_telemetry_env = [
+    "HF_HUB_OFFLINE=1",
+    "HF_HUB_DISABLE_TELEMETRY=1",
+    "DO_NOT_TRACK=1",
+    "VLLM_NO_USAGE_STATS=1",
+]
+tmp_audio_ttl_seconds = 3600
+
+[concurrency]
+lock_path = "data/state/.lock"
+lock_timeout_seconds = 10
+
+[agent]
+max_iterations = 12
+trace_dir = "data/traces"
