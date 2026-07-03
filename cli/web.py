@@ -1266,6 +1266,38 @@ async def post_review_decide(req: ReviewDecideRequest):
     })
 
 
+class VaultExportRequest(BaseModel):
+    session_id: str | None = None  # None -> export all reviewed-grade sessions
+
+
+@app.post("/api/export/vault")
+async def post_vault_export(req: VaultExportRequest):
+    """Obsidian/Markdown-vault export. Requires [export].vault_dir in
+    settings.toml (the web UI has no path picker by design -- the vault
+    location is configuration, not per-request input)."""
+    from cli.vault_export import ExportError, export_all, export_session
+
+    vault_dir = getattr(getattr(settings, "export", None), "vault_dir", "") or ""
+    if not vault_dir.strip():
+        return JSONResponse(
+            {"error": "No vault configured. Set [export].vault_dir in config/settings.toml."},
+            status_code=400,
+        )
+    meetings_dir = Path(settings.paths.data_dir) / "meetings"
+    todo_path = Path(settings.paths.data_dir) / "todo.md"
+    state_dir = Path(settings.paths.data_dir) / "state"
+    try:
+        if req.session_id:
+            path = await asyncio.to_thread(
+                export_session, req.session_id, meetings_dir, todo_path, state_dir, vault_dir
+            )
+            return JSONResponse({"status": "exported", "paths": [str(path)]})
+        written = await asyncio.to_thread(export_all, meetings_dir, todo_path, state_dir, vault_dir)
+        return JSONResponse({"status": "exported", "paths": [str(p) for p in written]})
+    except ExportError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
 class ReviewApplyRequest(BaseModel):
     session_id: str
 

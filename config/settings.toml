@@ -36,3 +36,9 @@ lock_timeout_seconds = 10
 [agent]
 max_iterations = 12               # ceiling on ReAct turns per run (M5)
 trace_dir = "data/traces"         # JSONL audit trail, one file per run
+
+[export]
+# Obsidian/Markdown-vault export target for `meeting-agent export` and the
+# dashboard Export button. Empty = disabled; set to your vault's root, e.g.
+# vault_dir = "C:/Users/you/Documents/ObsidianVault"
+vault_dir = ""

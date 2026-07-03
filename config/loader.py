@@ -63,6 +63,16 @@ class AgentConfig:
 
 
 @dataclass(frozen=True)
+class ExportConfig:
+    # Obsidian/Markdown-vault export target. Empty string = not configured;
+    # the export command/endpoint then requires an explicit --vault path.
+    # Deliberately the ONLY place this tool writes outside data/ -- the path
+    # is user-chosen configuration, never derived from content, and the MCP
+    # layer has no export tool (audit 2026-07 Strand E candidate 4).
+    vault_dir: str = ""
+
+
+@dataclass(frozen=True)
 class Settings:
     paths: PathsConfig
     llm: LLMConfig
@@ -70,6 +80,7 @@ class Settings:
     privacy: PrivacyConfig
     concurrency: ConcurrencyConfig
     agent: AgentConfig
+    export: ExportConfig = ExportConfig()
 
 
 def load_settings(path: Path) -> Settings:
@@ -81,7 +92,8 @@ def load_settings(path: Path) -> Settings:
         whisper=WhisperConfig(**raw["whisper"]),
         privacy=PrivacyConfig(**raw["privacy"]),
         concurrency=ConcurrencyConfig(**raw["concurrency"]),
-        # [agent] is optional in settings.toml -- defaults above keep older
-        # config files (M1-M4 era) loading without modification.
+        # [agent] and [export] are optional in settings.toml -- defaults above
+        # keep older config files (M1-M4 era) loading without modification.
         agent=AgentConfig(**raw.get("agent", {})),
+        export=ExportConfig(**raw.get("export", {})),
     )

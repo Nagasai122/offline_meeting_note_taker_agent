@@ -546,6 +546,46 @@ def briefing(
     typer.echo(render_briefing(result))
 
 
+@app.command()
+def export(
+    session_id: str = typer.Option(None, help="Session to export; omit with --all for everything"),
+    all: bool = typer.Option(False, "--all", help="Export every reviewed-grade session"),
+    vault: Path = typer.Option(None, help="Vault directory (overrides [export].vault_dir)"),
+    settings_path: Path = typer.Option(DEFAULT_SETTINGS_PATH),
+) -> None:
+    """
+    Export reviewed sessions to an Obsidian/Markdown vault as
+    `<vault>/Meetings/<yyyy-mm-dd> <slug>.md` with frontmatter and wiki-links.
+
+    One-way and idempotent; only re-renders content you already reviewed.
+    This is the one command that writes outside data/ -- to a vault path you
+    chose explicitly. Nothing here touches the network or todo.md.
+    """
+    from cli.vault_export import ExportError, export_all, export_session
+
+    settings = load_settings(settings_path)
+    vault_dir = vault if vault is not None else Path(settings.export.vault_dir or "")
+    meetings_dir = Path(settings.paths.data_dir) / "meetings"
+    todo_path = Path(settings.paths.data_dir) / "todo.md"
+    state_dir = Path(settings.paths.data_dir) / "state"
+
+    try:
+        if all:
+            written = export_all(meetings_dir, todo_path, state_dir, vault_dir)
+            typer.echo(f"Exported {len(written)} session(s) to {vault_dir}.")
+            for p in written:
+                typer.echo(f"  - {p}")
+        elif session_id:
+            path = export_session(session_id, meetings_dir, todo_path, state_dir, vault_dir)
+            typer.echo(f"Exported to {path}")
+        else:
+            typer.echo("Pass --session-id <id> or --all.", err=True)
+            raise typer.Exit(code=1)
+    except ExportError as exc:
+        typer.echo(f"Export failed: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+
 @app.command(name="reap-stale")
 def reap_stale(
     settings_path: Path = typer.Option(DEFAULT_SETTINGS_PATH),
