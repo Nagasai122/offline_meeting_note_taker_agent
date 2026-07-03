@@ -599,6 +599,18 @@ def export(
         raise typer.Exit(code=1)
 
 
+@app.command(name="app")
+def app_command() -> None:
+    """
+    Run Meeting Agent as a desktop application: start the local dashboard,
+    open the browser, and park a tray icon (right-click to quit). Install a
+    Start Menu shortcut with scripts/install_app.ps1.
+    """
+    from cli.app_launcher import run_app
+
+    raise typer.Exit(code=run_app())
+
+
 @app.command()
 def index(
     settings_path: Path = typer.Option(DEFAULT_SETTINGS_PATH),

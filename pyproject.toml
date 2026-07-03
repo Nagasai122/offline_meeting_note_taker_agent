@@ -31,6 +31,7 @@ dependencies = [
 diarisation = ["pyannote.audio>=3.3"]
 semantic-search = ["fastembed>=0.3", "sqlite-vec>=0.1.6"]
 mail-msg = ["extract-msg>=0.45"]
+app = ["pystray>=0.19", "Pillow>=10.0"]
 dev = ["pytest>=8.0", "pytest-cov>=5.0", "hypothesis>=6.100"]
 
 [project.scripts]

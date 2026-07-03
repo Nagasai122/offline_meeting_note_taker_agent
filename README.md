@@ -29,7 +29,20 @@ downstream of that premise; see the data-egress guarantee in
 `docs/architecture.md` for the specifics of how that is verified, not merely
 configured.
 
-## Day-to-day use: the web dashboard
+## Day-to-day use: the app
+
+```
+pip install -e ".[app]"
+powershell -ExecutionPolicy Bypass -File scripts\install_app.ps1   # once
+```
+
+Then launch **Meeting Agent** from the Start Menu: it starts the local
+dashboard, opens your browser at http://localhost:8000, and parks a tray
+icon (right-click → Quit). `meeting-agent app` does the same from a
+terminal, and `meeting-agent web` remains the bare server for
+scripting/debugging.
+
+## The web dashboard
 
 ```
 meeting-agent web                              # http://localhost:8000
