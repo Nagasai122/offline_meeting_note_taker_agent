@@ -3,7 +3,19 @@
 This document is the merged, approved plan (Phase 4) including all amendments from the
 plan → critique → synthesis cycle, plus the explicit data-egress guarantee added on
 final approval. It is the reference for "why" decisions were made, so implementation
-does not relitigate them later.
+does not relitigate them later. It remains the source of truth for the invariants
+below (data-egress guarantee, capability token, human-in-the-loop gate) — none of
+which changed in the v2 upgrade.
+
+**v2 status:** the meeting-type system, chunked extraction, document/mail/calendar
+context enrichment, transcript import, AI reasoning enhancements (loop closure,
+recurring-blocker escalation, weekly digest), manual task tracking with local
+reminders, and a full dashboard redesign are implemented. See
+[`architecture_v2.md`](architecture_v2.md) for that spec and
+[`target_architecture_v2.svg`](target_architecture_v2.svg) for the accompanying
+diagram; see [`claude_cli_implement_v2.md`](claude_cli_implement_v2.md) for the
+implementation log and [`code_review_2026_07_01.md`](code_review_2026_07_01.md) for
+the resolution status of issues found along the way.
 
 ## Scope and non-negotiable constraints
 
@@ -56,18 +68,37 @@ personal tool.
 meeting-agent/
 ├── README.md
 ├── pyproject.toml
-├── .env.example
-├── config/{settings.toml, logging.toml}
+├── config/{settings.toml, loader.py}
+├── concurrency/{lock.py, atomic.py}   # FileLock (amendment 4) + atomic writes
 ├── audio_capture/{sources.py, session_buffer.py, device_probe.py}
-├── transcribe/{whisper_runner.py, diarisation.py, postprocess.py}
-├── llm/{server_manager.py, model_profiles.py}
-├── mcp_server/{server.py, tools/*.py, state.py, schemas.py}
-├── agent/{loop.py, prompts/, trace_log.py}
-├── cli/{main.py, review_ui.py}
-├── data/{meetings/, todo.md, projects/, pending_review/, state/}
+├── transcribe/
+│   ├── whisper_runner.py, diarisation.py, postprocess.py
+│   ├── chunker.py            # v2: long-transcript chunked extraction
+│   └── import_parsers.py     # v2: VTT/SRT/Whisper-JSON/TXT transcript import
+├── llm/{server_manager.py, model_profiles.py, client.py, http_probe.py}
+├── mcp_server/
+│   ├── server.py, state.py, schemas.py, todo.py
+│   ├── quality_gate.py       # extraction-quality scoring for the review UI
+│   ├── meeting_type.py       # v2: MeetingType enum + slug/.type detection
+│   ├── mom_writer.py         # v2: type-aware Minutes of Meeting templates
+│   └── tools/
+│       ├── recording.py, transcription.py, extraction.py, review.py
+│       ├── loop_closure.py       # v2: IS-call prior-target reasoning
+│       └── blocker_escalation.py # v2: recurring-blocker detection
+├── agent/{loop.py, mcp_client.py, protocol.py, trace.py, prompts/}
+├── cli/
+│   ├── main.py, web.py, capability.py, review_apply.py, briefing.py
+│   ├── search.py, git_backup.py, teams_sync.py, feedback.py, mail_import.py
+│   ├── doc_ingest.py         # v2: PDF/PPTX/DOCX -> summarised context
+│   ├── mail_sync.py          # v2: Outlook mail-body context matching
+│   ├── calendar_matcher.py   # v2: session <-> calendar event matching
+│   ├── weekly_summary.py     # v2: cross-meeting weekly digest
+│   └── reminders.py          # v2: local Windows Toast due-task reminders
+├── static/{index.html, index.css, app.js}   # web dashboard
+├── data/{meetings/, todo.md, pending_review/, state/, calendar.json}
 ├── tmp/                # transient audio only, swept on every CLI invocation
-├── scripts/network_audit.py
-├── tests/
+├── scripts/{network_audit.py, gpu_check.py}
+├── tests/              # incl. tests/security/ -- CI zero-egress gates
 └── docs/
 ```
 
@@ -77,11 +108,20 @@ meeting-agent/
 IDLE -> (start_meeting) -> RECORDING
 RECORDING -> (stop_meeting) -> STOPPED            [audio still in tmp/]
 STOPPED -> (transcribe_meeting) -> TRANSCRIBED    [audio deleted, unconditionally]
+                ^
+    (v2) `import-transcript` / POST /api/upload/transcript creates the session
+    directly at STOPPED (no audio, nothing to delete) then transitions it to
+    TRANSCRIBED the same way -- it does not bypass transition(), it just never
+    passes through RECORDING.
 TRANSCRIBED -> (extract_action_items) -> EXTRACTED
 EXTRACTED -> (propose_todo_update) -> PROPOSED
 PROPOSED -> (human review, outside agent loop) -> REVIEWED
 REVIEWED -> (apply_reviewed_update) -> APPLIED    [terminal, archived]
-Any state -> FAILED (resumable via `meeting-agent process <session_id>`)
+Any non-terminal state -> FAILED. FAILED is terminal for that session_id
+(retry under a fresh session id -- see mcp_server/state.py); APPLIED is
+likewise terminal/archived. `meeting-agent process` can re-drive a session
+that stopped *before* FAILED (e.g. re-run extraction on a TRANSCRIBED
+session), but it does not resurrect a FAILED one.
 ```
 
 ## Amendments from critique (binding)
@@ -131,4 +171,51 @@ unconditional `finally`-block delete plus the startup sweep above).
 2. **Smart Context Extraction:** The AI agent no longer relies on hardcoded rules for assigning tasks or inferring meeting context. During the `extract_action_items` phase, it dynamically builds the LLM prompt by:
    - Injecting the active `todo.md` file, allowing it to infer ownership based on past actions.
    - Searching historical sessions (`data/meetings/`) for the last 3 meetings with the same slug across *any* day, chaining previous meeting summaries seamlessly.
-3. **Web Dashboard & Quick Actions:** Added an ad-hoc "Pinned: IS Sync" button to the UI that natively connects these features, generating meetings with fixed slugs (`is-sync`) to ensure continuity across routine syncs.
+
+## v2: Meeting types, context enrichment, AI reasoning (superseding the ad-hoc "Pinned: IS Sync" button above)
+
+The earlier "Pinned: IS Sync" quick-action generated a fixed `is-sync` slug that
+did not match the `is-call-*` chaining convention `extract_action_items`
+actually looks for — a real bug (found in `code_review_2026_07_01.md`,
+Persona 1). It has been replaced entirely by the **IS Call Hub**: a one-tap
+"Start IS Call" button that generates a proper `is-call-{timestamp}` slug
+server-side (`POST /api/record/start` with `meeting_type: "is-call"`), so
+chaining and loop-closure reasoning always work without relying on a title
+string matching by coincidence.
+
+Full v2 spec: [`architecture_v2.md`](architecture_v2.md). Summary of what
+landed:
+
+- **Meeting types** (`mcp_server/meeting_type.py`): every session is
+  `is-call` / `project-meeting` / `seminar`, resolved from an explicit UI
+  selection, a `.type` file, or slug-prefix detection (in that priority
+  order). Each type gets its own extraction prompt and Minutes-of-Meeting
+  template (`mcp_server/mom_writer.py`).
+- **Chunked extraction** (`transcribe/chunker.py`): transcripts over ~5000
+  estimated tokens (~35 min of speech) are split into overlapping chunks,
+  extracted sequentially against the single local LLM instance, merged
+  (deduplicating action items by fuzzy description match), and passed
+  through one synthesis pass — closing the silent-truncation gap on long
+  meetings identified in the code review (Persona 2).
+- **Context enrichment**: `cli/doc_ingest.py` (PDF/PPTX/DOCX/TXT → LLM
+  summary, ≤1000 tokens), `cli/mail_sync.py` (Outlook COM mail-body
+  matching), `cli/calendar_matcher.py` (session ↔ calendar event matching by
+  time overlap) — all best-effort, never fail the pipeline.
+- **Transcript import** (`transcribe/import_parsers.py`,
+  `meeting-agent import-transcript`, `POST /api/upload/transcript`): inject
+  an externally-produced transcript (VTT/SRT/Whisper-JSON/TXT) directly at
+  `TRANSCRIBED`.
+- **AI reasoning** (`mcp_server/tools/loop_closure.py`,
+  `mcp_server/tools/blocker_escalation.py`, `cli/weekly_summary.py`):
+  IS-call loop closure (did the prior session's targets get addressed?),
+  recurring-blocker detection across the last 7 IS calls, and a
+  user-initiated weekly cross-meeting digest.
+- **Manual tasks and reminders** (`cli/reminders.py`, extended `TodoItem` in
+  `mcp_server/todo.py` with `priority`/`status`/`source`/`progress_note`/`tag`):
+  user-created tasks alongside AI-extracted ones, status tracking, and local
+  Windows Toast notifications for due/overdue items.
+- **Dashboard redesign** (`static/index.html`, `static/index.css`,
+  `static/app.js`): IS Call Hub, pre-meeting context modal, highlight-with-note,
+  MoM preview, Settings panel, manual-task UI — currently the "Field Notebook"
+  visual theme (see `static/index.css`'s header comment for the design-token
+  system).

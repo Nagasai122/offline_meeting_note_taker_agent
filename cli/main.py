@@ -51,12 +51,19 @@ def _startup(settings_path: Path = DEFAULT_SETTINGS_PATH) -> None:
 def setup(
     profile: str = typer.Option(..., help="Model profile name from llm/model_profiles.py"),
     models_dir: Path = typer.Option(Path("models"), help="Local directory to cache weights in"),
+    skip_whisper: bool = typer.Option(False, help="Skip pre-fetching the configured Whisper model"),
+    settings_path: Path = typer.Option(DEFAULT_SETTINGS_PATH),
 ) -> None:
     """
     Download a model profile's weights for fully offline use afterwards.
 
     This is the ONLY command in this CLI that is permitted to make network requests.
     Every other command must function correctly with the network adapter disabled.
+
+    Also pre-fetches the Whisper model configured in settings.toml into the local
+    HF cache (unless --skip-whisper), so the first `process` run works with the
+    network adapter disabled -- previously that first run silently depended on a
+    warm cache (audit 2026-07, finding A-5.3).
     """
     try:
         from huggingface_hub import snapshot_download
@@ -82,7 +89,31 @@ def setup(
 
     typer.echo(f"Downloading '{profile_obj.weights_path}' to {target_dir} ...")
     typer.echo("(This is the only step in this tool that uses the network.)")
-    snapshot_download(repo_id=repo_id, local_dir=str(target_dir), allow_patterns=allow_patterns)
+    if profile_obj.revision:
+        typer.echo(f"Pinned revision: {profile_obj.revision}")
+    else:
+        typer.echo(
+            "WARNING: this profile has no pinned revision -- downloading the "
+            "current repo head. Prefer a profile with a pinned revision."
+        )
+    snapshot_download(
+        repo_id=repo_id, local_dir=str(target_dir),
+        allow_patterns=allow_patterns, revision=profile_obj.revision,
+    )
+
+    if not skip_whisper:
+        whisper_model = "base"
+        if settings_path.exists():
+            whisper_model = load_settings(settings_path).whisper.model
+        typer.echo(f"Pre-fetching faster-whisper model '{whisper_model}' into the local cache ...")
+        # Resolves the same Systran/distil-whisper repos faster-whisper would
+        # otherwise fetch lazily on the first transcription (which would fail
+        # offline with a cold cache).
+        from faster_whisper.utils import download_model
+
+        download_model(whisper_model)
+        typer.echo(f"Whisper model '{whisper_model}' cached.")
+
     typer.echo("Done. You may disconnect from the network for all other commands.")
 
 

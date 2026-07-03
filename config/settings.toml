@@ -12,7 +12,8 @@ startup_timeout_seconds = 300      # raised from 120: cold-loading a multi-GB fi
 health_check_path = "/health"
 
 [whisper]
-model = "base"                   # changed from "medium" to "base" for faster execution
+model = "distil-large-v3"        # near-large-v3 accuracy at ~2x its speed (audit 2026-07, D-4);
+                                 # weights are pre-fetched by `meeting-agent setup`
 device = "cuda"
 compute_type = "int8_float16"    # good VRAM/accuracy balance on 12-16GB cards
 diarisation_enabled = false      # best-effort only; requires the optional [diarisation] extra + a HF token

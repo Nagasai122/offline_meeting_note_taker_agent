@@ -41,6 +41,12 @@ class ModelProfile:
     supports_tool_calling: bool
     notes: str = ""
     extra_launch_args: list[str] = field(default_factory=list)
+    # Pinned HF revision (commit SHA) used by `meeting-agent setup` -- the one
+    # network step trusts a specific, reviewed snapshot rather than whatever
+    # the repo head happens to be at download time (bandit B615 /
+    # audit 2026-07 supply-chain recommendation). None = repo head, accepted
+    # only for placeholder/comparison profiles that are not the default.
+    revision: str | None = None
 
     def is_within_budget(self, available_vram_gb: float, headroom_gb: float = 2.0) -> bool:
         """
@@ -104,7 +110,8 @@ PROFILES: dict[str, ModelProfile] = {
             "active_profile without first measuring real VRAM headroom. Retained for "
             "side-by-side comparison against the dense profile below, not as default."
         ),
-        extra_launch_args=["--ctx-size", "4096", "--n-gpu-layers", "99"],
+        # SB-1.2: --parallel 1 for single-user KV cache isolation.
+        extra_launch_args=["--ctx-size", "4096", "--n-gpu-layers", "99", "--parallel", "1"],
     ),
     "qwen2_5_7b_gguf": ModelProfile(
         name="qwen2_5_7b_gguf",
@@ -125,9 +132,58 @@ PROFILES: dict[str, ModelProfile] = {
             "`meeting-agent setup --profile qwen2_5_7b_gguf` to fetch it; weights "
             "are not bundled."
         ),
-        extra_launch_args=["--ctx-size", "8192", "--n-gpu-layers", "99"],
+        # SB-1.2: --parallel 1 enforces single-request processing so no two
+        # sessions share KV cache slots (single-user tool; throughput is irrelevant).
+        extra_launch_args=["--ctx-size", "8192", "--n-gpu-layers", "99", "--parallel", "1"],
+        revision="bb5d59e06d9551d752d08b292a50eb208b07ab1f",  # verified 2026-07-03
+    ),
+    "qwen2_5_3b_gguf": ModelProfile(
+        name="qwen2_5_3b_gguf",
+        backend=Backend.LLAMA_SERVER,
+        quantisation=Quantisation.GGUF_Q4_K_M,
+        weights_path="Qwen/Qwen2.5-3B-Instruct-GGUF/Q4_K_M",
+        declared_vram_gb=2.5,
+        supports_tool_calling=False,
+        notes=(
+            "Fast 3B extraction-only profile (Model M.1). No tool calling — not "
+            "suitable for the ReAct agent loop. Intended for per-chunk extraction "
+            "and context summarisation tasks where the 7B model's latency is a "
+            "bottleneck. ~2GB footprint, fits alongside the main 7B on a 12GB card "
+            "if loaded sequentially. Use select_profile_for_task() to route. "
+            "Run `meeting-agent setup --profile qwen2_5_3b_gguf` to fetch."
+        ),
+        extra_launch_args=["--ctx-size", "4096", "--n-gpu-layers", "99", "--parallel", "1"],
+        revision="7dabda4d13d513e3e842b20f0d435c732f172cbe",  # verified 2026-07-03
     ),
 }
+
+
+FAST_TASKS = {"extraction", "context_summary"}
+
+
+def select_profile_for_task(task: str, default_profile: str, models_dir: "Path | None" = None) -> str:
+    """Model M.3: route fast, non-tool-calling tasks to the smaller 3B profile
+    when its weights are already on disk, falling back to default_profile otherwise.
+
+    Args:
+        task: one of FAST_TASKS ("extraction", "context_summary") or any other string.
+        default_profile: profile name to use when 3B is not applicable or missing.
+        models_dir: if provided, the 3B weights existence is verified before routing.
+
+    Returns:
+        The profile name that should be used for this task.
+    """
+    if task not in FAST_TASKS:
+        return default_profile
+    fast_profile_name = "qwen2_5_3b_gguf"
+    if fast_profile_name not in PROFILES:
+        return default_profile
+    if models_dir is not None:
+        from pathlib import Path as _Path
+        weights = _Path(models_dir) / PROFILES[fast_profile_name].weights_path
+        if not weights.exists():
+            return default_profile
+    return fast_profile_name
 
 
 def get_profile(name: str) -> ModelProfile:
