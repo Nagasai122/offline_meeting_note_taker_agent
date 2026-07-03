@@ -217,7 +217,7 @@ async def get_briefing():
             briefing["active_recording"] = {
                 "session_id": active_session_id,
                 "started_at": started_at,
-                "meeting_type": type_path.read_text().strip() if type_path.exists() else "general",
+                "meeting_type": type_path.read_text(encoding="utf-8").strip() if type_path.exists() else "general",
             }
 
     return JSONResponse(jsonable_encoder(briefing))
@@ -294,12 +294,12 @@ async def _start_recording_locked(req: StartRecordRequest | None) -> dict:
     # (architecture_v2.md §4); write it now so it exists before session state
     # does (state is only created later, in `process`/run_pipeline).
     if req and req.meeting_type:
-        (meetings_dir / f"{active_session_id}.type").write_text(req.meeting_type)
+        (meetings_dir / f"{active_session_id}.type").write_text(req.meeting_type, encoding="utf-8")
 
     # Save context if provided
     if req and req.context:
         context_path = meetings_dir / f"{active_session_id}.context.txt"
-        context_path.write_text(req.context)
+        context_path.write_text(req.context, encoding="utf-8")
 
     _active_whisper_model = req.whisper_model if req else None
 
@@ -348,7 +348,7 @@ async def log_highlight(req: HighlightRequest | None = None):
     highlight_path = Path(settings.paths.data_dir) / "meetings" / f"{active_session_id}.highlights.json"
     highlights = []
     if highlight_path.exists():
-        highlights = json.loads(highlight_path.read_text())
+        highlights = json.loads(highlight_path.read_text(encoding="utf-8"))
 
     if req and req.update_last and highlights:
         highlights[-1]["note"] = req.note
@@ -361,7 +361,7 @@ async def log_highlight(req: HighlightRequest | None = None):
             entry["segment_offset_seconds"] = req.segment_offset_seconds
         highlights.append(entry)
 
-    highlight_path.write_text(json.dumps(highlights))
+    highlight_path.write_text(json.dumps(highlights), encoding="utf-8")
     return {"status": "highlight_logged"}
 
 _SUPPORTED_DOC_SUFFIXES = {".pdf", ".pptx", ".docx", ".txt"}
@@ -646,7 +646,7 @@ async def upload_transcript(
             initial_state=state_mod.State.STOPPED, meeting_type=meeting_type, source="import",
             whisper_model="imported", **calendar_metadata,
         )
-        type_file_path(meetings_dir, session_id).write_text(meeting_type)
+        type_file_path(meetings_dir, session_id).write_text(meeting_type, encoding="utf-8")
 
         result = TranscriptionResult(
             session_id=session_id,
@@ -663,6 +663,11 @@ async def upload_transcript(
             settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
             transcript_path=str(meetings_dir / f"{session_id}.md"),
         )
+    except ValueError as exc:
+        # Malformed transcript content (truncated JSON, bad segment shape --
+        # import_parsers normalises these to ValueError). A bad upload is a
+        # client error, not a server crash.
+        return JSONResponse({"error": f"Could not parse transcript: {exc}"}, status_code=400)
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -1732,5 +1737,5 @@ async def complete_task(req: CompleteRequest):
             found = True
 
     if found:
-        todo_path.write_text(format_todo_file(todo_file))
+        todo_path.write_text(format_todo_file(todo_file), encoding="utf-8")
     return {"status": "success" if found else "not_found"}
