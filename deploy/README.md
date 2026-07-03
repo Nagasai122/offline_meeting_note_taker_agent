@@ -36,15 +36,14 @@ docker compose ps        # both services should report (healthy)
    capture is host-hardware-bound; inside containers this stack serves the
    transcript-import workflow, transcription of uploaded audio, extraction,
    and the review/apply dashboard. Record on the host, or import transcripts.
-2. **app↔llm service wiring needs one code change before the two-service
-   layout is fully live.** `cli/web.py`'s pipeline probes and
-   `llm/server_manager.start_server` currently assume a co-located LLM on
-   `127.0.0.1` (`start_server` deliberately raises `UnsafeBindAddressError`
-   for anything non-loopback — correct for bare metal, blocking for the
-   compose service name `llm`). Until the maintainer signs off on honouring
-   `settings.llm.host` for *outbound client connections only* (the listen
-   bind must stay loopback/internal), run single-host mode: `docker compose
-   up llm` + bare-metal `meeting-agent web` pointed at `127.0.0.1:8080`,
-   which works today with zero code changes.
+2. **app↔llm wiring (resolved 2026-07-03):** the dashboard's outbound LLM
+   probes/clients honour `settings.llm.host` (the compose file mounts
+   `settings.container.toml` with `host = "llm"`), so the two-service
+   layout works. The *listen* side is unchanged — `start_server` still
+   refuses non-loopback binds; inside the llm container the bind is the
+   container's own namespace on an internal-only network. One caveat: in
+   container mode do not use the dashboard's "start LLM" System action
+   (the llm service owns that process); the pipeline detects the running
+   service and reuses it.
 3. GPU passthrough requires Docker Desktop ≥ 4.19 with WSL2 backend on
    Windows, or nvidia-container-toolkit on Linux.

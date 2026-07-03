@@ -567,7 +567,7 @@ async def run_extraction_only(session_id: str) -> None:
     llm_already_running = False
     try:
         import socket as _socket
-        with _socket.create_connection(("127.0.0.1", llm_port), timeout=0.5):
+        with _socket.create_connection((settings.llm.host, llm_port), timeout=0.5):
             llm_already_running = True
     except OSError:
         pass
@@ -909,7 +909,7 @@ async def run_pipeline(session_id: str, auto_accept: bool = False, whisper_model
     llm_already_running = False
     try:
         import socket as _socket
-        with _socket.create_connection(("127.0.0.1", llm_port), timeout=0.5):
+        with _socket.create_connection((settings.llm.host, llm_port), timeout=0.5):
             llm_already_running = True
     except OSError:
         pass
@@ -1552,7 +1552,7 @@ async def server_status():
     port_listening = False
     try:
         import socket
-        with socket.create_connection(("127.0.0.1", llm_port), timeout=0.3):
+        with socket.create_connection((settings.llm.host, llm_port), timeout=0.3):
             port_listening = True
     except OSError:
         pass

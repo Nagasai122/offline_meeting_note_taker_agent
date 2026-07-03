@@ -176,8 +176,24 @@ def test_every_httpx_client_and_request_sets_trust_env_false():
     assert not flagged, "httpx usage without trust_env=False:\n  " + "\n  ".join(flagged)
 
 
-def test_socket_usage_in_web_dashboard_is_loopback_only():
-    """cli/web.py's raw socket probes must target 127.0.0.1 literally."""
+def test_socket_usage_in_web_dashboard_is_loopback_or_configured_llm_host():
+    """cli/web.py's raw socket probes must target either a loopback literal or
+    exactly `settings.llm.host` — the configured LLM endpoint, which is
+    127.0.0.1 on bare metal and the compose service name on the
+    internal-only (no-egress) container network. Anything else fails.
+    The *listen* side is unaffected: llm/server_manager.py's
+    UnsafeBindAddressError still rejects non-loopback binds."""
+
+    def _is_settings_llm_host(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr == "host"
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "llm"
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == "settings"
+        )
+
     source = (REPO_ROOT / "cli" / "web.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     flagged: list[str] = []
@@ -193,11 +209,14 @@ def test_socket_usage_in_web_dashboard_is_loopback_only():
             host_ok = (
                 isinstance(addr, ast.Tuple)
                 and addr.elts
-                and isinstance(addr.elts[0], ast.Constant)
-                and addr.elts[0].value in ("127.0.0.1", "::1", "localhost")
+                and (
+                    (isinstance(addr.elts[0], ast.Constant)
+                     and addr.elts[0].value in ("127.0.0.1", "::1", "localhost"))
+                    or _is_settings_llm_host(addr.elts[0])
+                )
             )
             if not host_ok:
-                flagged.append(f"cli/web.py:{node.lineno}: create_connection to non-literal/non-loopback host")
+                flagged.append(f"cli/web.py:{node.lineno}: create_connection to unexpected host expression")
     assert not flagged, "\n".join(flagged)
 
 
