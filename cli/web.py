@@ -1,10 +1,11 @@
+import collections
 import subprocess
 import os
 import json
 import asyncio
 import logging
 from pathlib import Path
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Form, File, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -12,17 +13,17 @@ from datetime import datetime
 from sse_starlette.sse import EventSourceResponse
 import threading
 import time
-import numpy as np
-import httpx
+from llm.http_probe import make_local_client, probe_ok
 
 from config.loader import load_settings
-DEFAULT_SETTINGS_PATH = Path("config/settings.toml")
 from cli.briefing import build_daily_briefing
 from audio_capture.session_buffer import sweep_orphaned_audio
 import sys
 
 from contextlib import asynccontextmanager
 import re
+
+DEFAULT_SETTINGS_PATH = Path("config/settings.toml")
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,7 @@ app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 recording_processes = []
 active_session_id = None
 processing = False
+pipeline_stage: str | None = None   # None | "RECORDING" | "TRANSCRIBING" | "LLM_LOADING" | "EXTRACTING" | "AWAITING_REVIEW" | "ERROR"
 live_transcript = ""
 pipeline_error = None
 
@@ -127,10 +129,21 @@ def live_transcription_worker(session_id):
         last_size = 0
         while active_session_id == session_id:
             time.sleep(3)
-            # Prefer loopback (captures the other party) but fall back to mic.
-            wav_path = loop_wav_path if loop_wav_path.exists() else mic_wav_path
-            if not wav_path.exists():
-                continue
+            # Prefer loopback (captures the other party's audio in a video call)
+            # but fall back to mic if loopback has no real audio content (e.g.
+            # when recording ambient/phone audio where WASAPI loopback captures
+            # nothing and produces a header-only WAV). Checking size > 44 (the
+            # WAV header size) distinguishes a live loopback stream from an empty
+            # placeholder file, preventing the worker from being stuck on a dead
+            # loopback path and never reaching the mic audio.
+            loop_size = loop_wav_path.stat().st_size if loop_wav_path.exists() else 0
+            mic_size  = mic_wav_path.stat().st_size  if mic_wav_path.exists()  else 0
+            if loop_size > 44:
+                wav_path = loop_wav_path
+            elif mic_size > 44:
+                wav_path = mic_wav_path
+            else:
+                continue  # neither source has real audio yet
 
             current_size = wav_path.stat().st_size
             if current_size <= 44:  # header-only or empty WAV — nothing to transcribe yet
@@ -177,41 +190,122 @@ async def get_briefing():
     state_dir = Path(settings.paths.data_dir) / "state"
     briefing = build_daily_briefing(todo_path, state_dir)
     # Add our global processing state
-    global processing, pipeline_error
+    global processing, pipeline_error, pipeline_stage
     briefing["processing"] = processing
+    briefing["pipeline_stage"] = pipeline_stage
     briefing["recording"] = len(recording_processes) > 0
     briefing["error"] = pipeline_error
+
+    # bugfix-02 Fix F: the recording's true start time so a browser refresh
+    # doesn't reset the client's elapsed-time reference to Date.now(). No new
+    # persistence needed -- session state doesn't exist yet at this point in
+    # the lifecycle (create_session only happens later, in `process`), but the
+    # timestamp is already durably encoded in active_session_id itself (the
+    # same "-YYYYMMDD-HHMMSS" suffix cli/calendar_matcher.py already parses),
+    # so this is a read, not a new write path. New field, not a change to the
+    # existing boolean `recording` field above, to avoid touching that
+    # contract's existing consumers.
+    briefing["active_recording"] = None
+    if briefing["recording"] and active_session_id:
+        ts_match = re.search(r"-(\d{8})-(\d{6})$", active_session_id)
+        if ts_match:
+            started_at = datetime.strptime(
+                f"{ts_match.group(1)}{ts_match.group(2)}", "%Y%m%d%H%M%S"
+            ).isoformat()
+            meetings_dir = Path(settings.paths.data_dir) / "meetings"
+            type_path = meetings_dir / f"{active_session_id}.type"
+            briefing["active_recording"] = {
+                "session_id": active_session_id,
+                "started_at": started_at,
+                "meeting_type": type_path.read_text().strip() if type_path.exists() else "general",
+            }
+
     return JSONResponse(jsonable_encoder(briefing))
 
 class StartRecordRequest(BaseModel):
     context: str | None = None
     title: str | None = None
+    meeting_type: str | None = None  # "is-call" | "project-meeting" | "seminar"
+    whisper_model: str | None = None
+
+# Tracks the whisper_model override (if any) for the currently-active session,
+# so run_pipeline can thread it into the `process` subprocess. Module-level
+# global, same pattern/caveat as recording_processes/active_session_id above.
+_active_whisper_model: str | None = None
+
+# Guards the check-then-spawn sequence in /api/record/start (bugfix-02 Fix C):
+# without it, two near-simultaneous requests could both pass the "already
+# recording" check before either has set recording_processes, each spawning
+# its own record subprocess -- the loser's process becomes untracked/orphaned
+# rather than rejected. Lazily created (not at module import time) so it is
+# always bound to the event loop that is actually running, per asyncio.Lock's
+# own guidance against constructing it before a loop exists.
+_recording_lock: asyncio.Lock | None = None
+
+
+def _get_recording_lock() -> asyncio.Lock:
+    global _recording_lock
+    if _recording_lock is None:
+        _recording_lock = asyncio.Lock()
+    return _recording_lock
+
 
 @app.post("/api/record/start")
 async def start_recording(req: StartRecordRequest | None = None):
-    global recording_processes, active_session_id
+    global recording_processes, active_session_id, _active_whisper_model
+    async with _get_recording_lock():
+        return await _start_recording_locked(req)
+
+
+async def _start_recording_locked(req: StartRecordRequest | None) -> dict:
+    global recording_processes, active_session_id, _active_whisper_model
     if recording_processes and all(p.poll() is None for p in recording_processes):
         return {"status": "already recording", "session_id": active_session_id}
-        
+
     timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-    
-    if req and req.title:
+
+    if req and req.meeting_type == "is-call":
+        # One-tap flow (architecture_v2.md §12.2): bypasses the title prompt
+        # entirely and uses the is-call-* slug so meeting_type auto-detection
+        # (mcp_server.meeting_type.detect_meeting_type) recognises it even if
+        # the .type file were ever lost.
+        active_session_id = f"is-call-{timestamp}"
+    elif req and req.title:
         # Slugify the title
         slug = req.title.lower()
         slug = re.sub(r'[^a-z0-9]+', '-', slug).strip('-')
         slug = slug[:40] # cap length
+        # Prefix so slug-based re-detection (mcp_server.meeting_type.detect_meeting_type)
+        # agrees with the explicit selection even if the .type file is ever lost --
+        # important now that the slug-detection default is GENERAL, not PROJECT, so an
+        # un-prefixed project-meeting slug would otherwise silently misclassify.
+        if req.meeting_type == "seminar":
+            slug = f"seminar-{slug}"
+        elif req.meeting_type == "project-meeting":
+            slug = f"project-{slug}"
         active_session_id = f"{slug}-{timestamp}"
     else:
-        active_session_id = f"meeting-{timestamp}"
-    
+        active_session_id = f"general-{timestamp}"
+
+    meetings_dir = Path(settings.paths.data_dir) / "meetings"
+    meetings_dir.mkdir(exist_ok=True, parents=True)
+
+    # Explicit UI selection is priority 1 in the meeting-type resolution order
+    # (architecture_v2.md §4); write it now so it exists before session state
+    # does (state is only created later, in `process`/run_pipeline).
+    if req and req.meeting_type:
+        (meetings_dir / f"{active_session_id}.type").write_text(req.meeting_type)
+
     # Save context if provided
     if req and req.context:
-        context_path = Path(settings.paths.data_dir) / "meetings" / f"{active_session_id}.context.txt"
-        context_path.parent.mkdir(exist_ok=True, parents=True)
+        context_path = meetings_dir / f"{active_session_id}.context.txt"
         context_path.write_text(req.context)
-    
-    global live_transcript
+
+    _active_whisper_model = req.whisper_model if req else None
+
+    global live_transcript, pipeline_stage
     live_transcript = ""
+    pipeline_stage = "RECORDING"
     threading.Thread(target=live_transcription_worker, args=(active_session_id,), daemon=True).start()
 
     cmd_mic = [sys.executable, "-m", "cli.main", "record", "--session-id", f"{active_session_id}-mic", "--source", "microphone"]
@@ -231,34 +325,377 @@ async def start_recording(req: StartRecordRequest | None = None):
 
     return {"status": "started", "session_id": active_session_id, "loopback": loopback_available}
 
+class HighlightRequest(BaseModel):
+    note: str | None = None
+    segment_offset_seconds: float | None = None
+    update_last: bool = False
+
+
 @app.post("/api/record/highlight")
-async def log_highlight():
+async def log_highlight(req: HighlightRequest | None = None):
+    """Log a highlight timestamp during a live recording.
+
+    Called twice per highlight from the dashboard (architecture_v2.md §12.4):
+    once bare on button click (so the highlight's timestamp reflects the
+    click instant even if the user never adds a note), and optionally again
+    with update_last=true if a note is typed within the 8s inline window --
+    that second call amends the just-logged entry rather than appending a
+    second, near-duplicate one."""
     global active_session_id
     if not active_session_id:
         return {"status": "not recording"}
-        
+
     highlight_path = Path(settings.paths.data_dir) / "meetings" / f"{active_session_id}.highlights.json"
     highlights = []
     if highlight_path.exists():
         highlights = json.loads(highlight_path.read_text())
-    
-    highlights.append({"timestamp": datetime.now().isoformat()})
+
+    if req and req.update_last and highlights:
+        highlights[-1]["note"] = req.note
+        highlights[-1]["segment_offset_seconds"] = req.segment_offset_seconds
+    else:
+        entry = {"timestamp": datetime.now().isoformat()}
+        if req and req.note:
+            entry["note"] = req.note
+        if req and req.segment_offset_seconds is not None:
+            entry["segment_offset_seconds"] = req.segment_offset_seconds
+        highlights.append(entry)
+
     highlight_path.write_text(json.dumps(highlights))
     return {"status": "highlight_logged"}
 
+_SUPPORTED_DOC_SUFFIXES = {".pdf", ".pptx", ".docx", ".txt"}
+_MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50MB
+
+
+@app.post("/api/context/upload")
+async def upload_context_document(session_id: str = Form(...), file: UploadFile = File(...)):
+    """Pre-meeting document context upload (architecture_v2.md §7.3): extracts
+    text offline, summarises it via the local LLM (bounded to ~1000 tokens),
+    and writes data/meetings/<session_id>.doc_context.txt."""
+    from mcp_server.schemas import validate_session_id, SchemaValidationError
+
+    try:
+        validate_session_id(session_id)
+    except SchemaValidationError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+
+    meetings_dir = Path(settings.paths.data_dir) / "meetings"
+    # A session created only via /api/record/start has no state file yet (state
+    # is created later, in `process`) -- so "session exists" here means either
+    # a state file OR a prior artefact (e.g. .type/.context.txt) under meetings_dir,
+    # not strictly state_mod.load_session_state succeeding.
+    state_dir = Path(settings.paths.data_dir) / "state"
+    session_known = (state_dir / f"{session_id}.json").exists() or any(
+        meetings_dir.glob(f"{session_id}.*")
+    ) or session_id == active_session_id
+    if not session_known:
+        return JSONResponse({"error": f"Unknown session '{session_id}'."}, status_code=404)
+
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in _SUPPORTED_DOC_SUFFIXES:
+        return JSONResponse(
+            {"error": f"Unsupported file type '{suffix}'. Allowed: {sorted(_SUPPORTED_DOC_SUFFIXES)}"},
+            status_code=400,
+        )
+
+    contents = await file.read()
+    if len(contents) > _MAX_UPLOAD_BYTES:
+        return JSONResponse({"error": "File exceeds 50MB limit."}, status_code=413)
+
+    tmp_dir = Path(settings.paths.tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    safe_filename = Path(file.filename or "upload").name  # strip any path components
+    tmp_path = tmp_dir / f"{session_id}_doc_{safe_filename}"
+    tmp_path.write_bytes(contents)
+
+    try:
+        from cli.doc_ingest import ingest_document
+        from llm.client import HttpLLMClient
+
+        llm_client = HttpLLMClient(base_url=f"http://{settings.llm.host}:{settings.llm.port}")
+        output_path = await asyncio.to_thread(
+            ingest_document, tmp_path, session_id, meetings_dir, llm_client.complete
+        )
+        summary_tokens = len(output_path.read_text(encoding="utf-8").split())
+    except (ValueError, NotImplementedError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    return JSONResponse({
+        "status": "processed", "session_id": session_id,
+        "filename": safe_filename, "summary_tokens": summary_tokens,
+    })
+
+
+class MailContextRequest(BaseModel):
+    session_id: str | None = None
+    subject_hint: str
+
+
+@app.post("/api/context/mail")
+async def fetch_mail_context_endpoint(req: MailContextRequest):
+    """Best-effort Outlook mail-body context fetch (architecture_v2.md §9).
+    Never raises on Outlook being unavailable -- returns status="no_match".
+
+    session_id is optional: the pre-meeting context modal (architecture_v2.md
+    §12.3) calls this *before* a recording -- and therefore a session_id --
+    exists (the slug is only decided server-side in /api/record/start). In
+    that case this returns the full body for the client to fold into the
+    agenda/context text sent at record-start time, rather than persisting a
+    .mail_context.txt for a session that doesn't exist yet. When session_id
+    IS provided (e.g. a future "fetch during an active recording" call site),
+    it persists as before."""
+    from cli.mail_sync import fetch_mail_context, save_mail_context
+
+    if req.session_id is not None:
+        from mcp_server.schemas import validate_session_id, SchemaValidationError
+        try:
+            validate_session_id(req.session_id)
+        except SchemaValidationError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=422)
+
+    session_start = datetime.now()
+    if req.session_id:
+        ts_match = re.search(r"-(\d{8})-(\d{6})$", req.session_id)
+        if ts_match:
+            session_start = datetime.strptime(f"{ts_match.group(1)}{ts_match.group(2)}", "%Y%m%d%H%M%S")
+
+    body = await asyncio.to_thread(fetch_mail_context, session_start, req.subject_hint)
+    if body is None:
+        return JSONResponse({"status": "no_match"})
+
+    if req.session_id:
+        meetings_dir = Path(settings.paths.data_dir) / "meetings"
+        save_mail_context(req.session_id, meetings_dir, body)
+        return JSONResponse({"status": "saved", "preview": body[:100]})
+
+    return JSONResponse({"status": "found", "body": body, "preview": body[:100]})
+
+
+_SUPPORTED_TRANSCRIPT_SUFFIXES = {".json", ".vtt", ".srt", ".txt"}
+
+
+def _fail_session_best_effort(session_id: str, exc: Exception) -> None:
+    """Transition `session_id` to FAILED after an unhandled pipeline exception,
+    so it doesn't sit at STOPPED/TRANSCRIBED/EXTRACTED forever with only the
+    ephemeral `pipeline_error` global (cleared by the next pipeline run) as any
+    record of what happened -- bugfix-02 Fix B. Deliberately best-effort:
+    - if the session has no state file yet (failure before create_session),
+      there's nothing to transition;
+    - if it's already terminal (FAILED/APPLIED) -- e.g. an inner step like
+      apply_reviewed_update's TODO_FILE_UNPARSEABLE handling already called
+      transition(FAILED) itself before re-raising -- this is a deliberate
+      no-op, not a second failure to report.
+    Never raises: a failure to *record* the failure must not mask the
+    original exception at the caller's except block."""
+    from mcp_server.state import InvalidTransitionError, State, load_session_state, transition
+
+    state_dir = Path(settings.paths.data_dir) / "state"
+    try:
+        current = load_session_state(state_dir, session_id)
+    except FileNotFoundError:
+        return
+    if current.state in (State.FAILED, State.APPLIED):
+        return
+    try:
+        transition(
+            state_dir, session_id, State.FAILED,
+            settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
+            error=str(exc), error_type=type(exc).__name__,
+        )
+    except InvalidTransitionError as state_exc:
+        logger.error("Could not transition session %s to FAILED: %s", session_id, state_exc)
+
+
+async def run_extraction_only(session_id: str) -> None:
+    """Run agent-run for a session already at TRANSCRIBED (import-transcript's
+    web counterpart -- no process/transcribe step, since there is no audio).
+    Mirrors run_pipeline's LLM-readiness + agent-run steps only."""
+    global processing, pipeline_error
+    pipeline_error = None
+    llm_port = settings.llm.port
+    llm_already_running = False
+    try:
+        import socket as _socket
+        with _socket.create_connection(("127.0.0.1", llm_port), timeout=0.5):
+            llm_already_running = True
+    except OSError:
+        pass
+
+    serve_proc = None
+    serve_log = None
+    if not llm_already_running:
+        logger.info("[%s] Starting LLM Server...", session_id)
+        serve_proc, serve_log = _spawn_serve_subprocess_with_log()
+
+    try:
+        await _wait_for_llm_ready(settings.llm.startup_timeout_seconds, serve_proc, serve_log)
+        logger.info("[%s] Running agent (import)...", session_id)
+        code, out = await _run_subprocess([sys.executable, "-m", "cli.main", "agent-run", "--session-id", session_id])
+        if code != 0:
+            raise Exception(f"Agent processing failed: {out}")
+        logger.info("[%s] Extraction complete -- items awaiting human review in data/pending_review/.", session_id)
+    except Exception as e:
+        logger.error("[%s] Error in import pipeline: %s", session_id, e, exc_info=True)
+        pipeline_error = str(e)
+        _fail_session_best_effort(session_id, e)
+    finally:
+        if serve_proc is not None:
+            serve_proc.terminate()
+            try:
+                serve_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                serve_proc.kill()
+        processing = False
+
+
+@app.post("/api/upload/transcript")
+async def upload_transcript(
+    file: UploadFile = File(...),
+    session_id: str | None = Form(None),
+    meeting_type: str = Form("project-meeting"),
+    calendar_event_id: str | None = Form(None),
+):
+    """Import an externally-produced transcript directly at TRANSCRIBED
+    (architecture_v2.md §8), then background the rest of the pipeline exactly
+    as run_pipeline does for a recorded session, minus the transcribe step.
+
+    `calendar_event_id` is optional (bugfix-01 Fix 5.3): when given, the
+    matching event from data/calendar.json (matched via _calendar_event_id,
+    since the cache has no native id field) is attached to the session's
+    metadata, the same fields `cli.calendar_matcher.save_calendar_match` would
+    write for an auto-matched live recording. If the id doesn't resolve to a
+    real event, this logs a warning and proceeds without a calendar link --
+    it never fails the import over optional enrichment."""
+    from mcp_server.meeting_type import MeetingType, type_file_path
+    from mcp_server.schemas import validate_session_id, SchemaValidationError
+    from mcp_server import state as state_mod
+
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in _SUPPORTED_TRANSCRIPT_SUFFIXES:
+        return JSONResponse(
+            {"error": f"Unsupported file type '{suffix}'. Allowed: {sorted(_SUPPORTED_TRANSCRIPT_SUFFIXES)}"},
+            status_code=400,
+        )
+    try:
+        MeetingType(meeting_type)
+    except ValueError:
+        return JSONResponse({"error": f"Invalid meeting_type {meeting_type!r}."}, status_code=422)
+
+    if session_id is None:
+        session_id = f"import-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    else:
+        try:
+            validate_session_id(session_id)
+        except SchemaValidationError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=422)
+        state_dir_check = Path(settings.paths.data_dir) / "state"
+        if (state_dir_check / f"{session_id}.json").exists():
+            return JSONResponse({"error": f"Session '{session_id}' already exists."}, status_code=409)
+
+    contents = await file.read()
+    if len(contents) > _MAX_UPLOAD_BYTES:
+        return JSONResponse({"error": "File exceeds 50MB limit."}, status_code=413)
+
+    tmp_dir = Path(settings.paths.tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = tmp_dir / f"{session_id}_transcript{suffix}"
+    tmp_path.write_bytes(contents)
+
+    try:
+        from transcribe.import_parsers import parse_transcript_file
+        from transcribe.postprocess import write_transcript
+        from transcribe.whisper_runner import TranscriptionResult, TranscriptSegment
+
+        segments = parse_transcript_file(tmp_path)
+        if not segments:
+            return JSONResponse({"error": "No segments could be parsed from this file."}, status_code=400)
+
+        state_dir = Path(settings.paths.data_dir) / "state"
+        meetings_dir = Path(settings.paths.data_dir) / "meetings"
+        meetings_dir.mkdir(parents=True, exist_ok=True)
+
+        calendar_metadata: dict = {}
+        if calendar_event_id:
+            calendar_cache = Path(settings.paths.data_dir) / "calendar.json"
+            if calendar_cache.exists():
+                try:
+                    cached_events = json.loads(calendar_cache.read_text(encoding="utf-8"))
+                    matched_event = next(
+                        (e for e in cached_events if _calendar_event_id(e) == calendar_event_id), None
+                    )
+                    if matched_event:
+                        calendar_metadata = {
+                            "calendar_event_id": calendar_event_id,
+                            "calendar_subject": matched_event.get("subject"),
+                            "calendar_start": matched_event.get("start"),
+                            "calendar_organiser": matched_event.get("organizer") or matched_event.get("organiser"),
+                        }
+                    else:
+                        logger.warning(
+                            "[%s] calendar_event_id %r did not match any cached event; "
+                            "proceeding without a calendar link.", session_id, calendar_event_id,
+                        )
+                except (json.JSONDecodeError, OSError) as exc:
+                    logger.warning("[%s] Could not read calendar.json for linking: %s", session_id, exc)
+
+        state_mod.create_session(
+            state_dir, session_id, settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
+            initial_state=state_mod.State.STOPPED, meeting_type=meeting_type, source="import",
+            whisper_model="imported", **calendar_metadata,
+        )
+        type_file_path(meetings_dir, session_id).write_text(meeting_type)
+
+        result = TranscriptionResult(
+            session_id=session_id,
+            segments=[TranscriptSegment(**seg) for seg in segments],
+            language="unknown",
+            duration_seconds=segments[-1]["end"],
+            model_name="imported",
+            diarised=False,
+        )
+        write_transcript(meetings_dir, result)
+
+        state_mod.transition(
+            state_dir, session_id, state_mod.State.TRANSCRIBED,
+            settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
+            transcript_path=str(meetings_dir / f"{session_id}.md"),
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    global processing
+    processing = True
+    asyncio.create_task(run_extraction_only(session_id))
+
+    return JSONResponse({"status": "importing", "session_id": session_id, "segments_count": len(segments)})
+
+
 @app.post("/api/record/stop")
-async def stop_recording(auto_accept: bool = False):
+async def stop_recording(auto_accept: bool = False, session_id: str | None = None):
     """`auto_accept=False` (default) stops the pipeline after agent-run and
     leaves extracted items in data/pending_review/ for a human to review via
     the normal `meeting-agent review`/`apply` commands -- preserving the
     project's human-in-the-loop guarantee. Pass `auto_accept=true` only if you
     explicitly want the web dashboard to accept every extracted item with no
-    review step; this is an opt-in, not the default."""
-    global recording_processes, active_session_id, processing
+    review step; this is an opt-in, not the default.
+
+    SB-2.2: optional `session_id` parameter — when provided, the request is
+    rejected with 409 if it doesn't match the currently-active session, so a
+    stale or replayed stop request can't silently terminate the wrong session."""
+    global recording_processes, active_session_id, processing, _active_whisper_model
     if not recording_processes:
         return {"status": "not recording"}
+    if session_id is not None and session_id != active_session_id:
+        return JSONResponse(
+            {"error": f"session_id mismatch: request has '{session_id}', active is '{active_session_id}'"},
+            status_code=409,
+        )
 
     sess_id = active_session_id
+    whisper_model_for_session = _active_whisper_model
 
     # Signal both subprocesses to stop gracefully via sentinel files.  On Windows,
     # p.terminate() = TerminateProcess() which kills instantly before Python's
@@ -285,10 +722,11 @@ async def stop_recording(auto_accept: bool = False):
 
     recording_processes = []
     active_session_id = None
+    _active_whisper_model = None
     processing = True
 
     # Run the pipeline synchronously but offload to a background task so we don't block the UI
-    asyncio.create_task(run_pipeline(sess_id, auto_accept=auto_accept))
+    asyncio.create_task(run_pipeline(sess_id, auto_accept=auto_accept, whisper_model=whisper_model_for_session))
     return {"status": "processing_started", "session_id": sess_id, "auto_accept": auto_accept}
 
 @app.get("/api/record/live")
@@ -307,41 +745,107 @@ async def get_live_transcript(request: Request):
             
     return EventSourceResponse(event_generator())
 
-async def _wait_for_llm_ready(timeout_seconds: float) -> None:
+def _spawn_serve_subprocess_with_log() -> tuple[subprocess.Popen, "collections.deque"]:
+    """Launch `cli.main serve` with its stdout captured into a bounded, thread-safe
+    deque, so a failure can be diagnosed (process-liveness + last output) instead of
+    just silently waiting out the full health-check timeout. Mirrors the same
+    capture pattern llm/server_manager.py uses for the llama-server grandchild --
+    this captures the `cli.main serve` child's output, which relays that same
+    grandchild output via its own logger."""
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "cli.main", "serve"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    log_buffer: collections.deque = collections.deque(maxlen=500)
+
+    def _relay() -> None:
+        if proc.stdout is None:
+            return
+        for line in proc.stdout:
+            log_buffer.append(line.rstrip())
+
+    threading.Thread(target=_relay, daemon=True).start()
+    return proc, log_buffer
+
+
+async def _wait_for_llm_ready(
+    timeout_seconds: float,
+    serve_proc: subprocess.Popen | None = None,
+    log_buffer=None,
+) -> None:
     """Poll the LLM server's own health endpoint instead of guessing a fixed
     sleep -- a 30B-class model can take well over 15s to cold-load, and a
     small model is ready in a couple of seconds, so a fixed sleep was either
-    too short (raw connection-refused failures downstream) or wastefully long."""
+    too short (raw connection-refused failures downstream) or wastefully long.
+
+    `serve_proc`/`log_buffer` are optional: when the caller spawned the
+    `cli.main serve` subprocess itself (not reusing an already-running server),
+    passing them lets this function fail fast if that process exits early,
+    with its captured output in the error, rather than waiting out the full
+    timeout against a process that is already dead."""
     health_url = f"http://{settings.llm.host}:{settings.llm.port}{settings.llm.health_check_path}"
+    v1_health_url = f"http://{settings.llm.host}:{settings.llm.port}/v1/health"
     deadline = time.monotonic() + timeout_seconds
-    async with httpx.AsyncClient(trust_env=False) as client:
+
+    def _log_tail() -> str:
+        if not log_buffer:
+            return "(no output captured)"
+        tail = list(log_buffer)[-20:]
+        return "\n".join(tail) if tail else "(no output captured)"
+
+    async with make_local_client() as client:
         while time.monotonic() < deadline:
-            try:
-                resp = await client.get(health_url, timeout=2.0)
-                if resp.status_code == 200:
+            if serve_proc is not None and serve_proc.poll() is not None:
+                raise RuntimeError(
+                    f"`meeting-agent serve` exited (code={serve_proc.returncode}) before the "
+                    f"LLM server became healthy.\nLast output:\n{_log_tail()}\n"
+                    "Common causes: model weights not found (run `meeting-agent setup "
+                    "--profile <name>`), CUDA out of memory, or a corrupt download."
+                )
+            for url in (health_url, v1_health_url):
+                if await probe_ok(client, url, timeout=2.0):
                     return
-            except httpx.RequestError:
-                pass
             await asyncio.sleep(1)
-    raise TimeoutError(f"LLM server did not become healthy within {timeout_seconds:.0f}s at {health_url}")
+
+    raise TimeoutError(
+        f"LLM server did not become healthy within {timeout_seconds:.0f}s at {health_url}.\n"
+        f"Last server output:\n{_log_tail()}\n"
+        "If you see 'model file does not exist': run `meeting-agent setup --profile <name>`.\n"
+        "If you see a CUDA error: check `nvidia-smi` and your driver version.\n"
+        "If there is no output at all: confirm LLAMA_SERVER_EXE points at a real executable."
+    )
 
 
-async def _run_subprocess(args: list[str]) -> tuple[int, str]:
+async def _run_subprocess(
+    args: list[str], extra_env: dict[str, str] | None = None
+) -> tuple[int, str]:
     """Run a subprocess without blocking the event loop.  `subprocess.run()`
     is synchronous I/O; called directly inside a coroutine it would freeze
     every other request (SSE live-transcript, /api/briefing polls, highlight
-    clicks) for the full duration of the child process."""
+    clicks) for the full duration of the child process.
+
+    `extra_env` is merged on top of the current environment so callers can pass
+    per-invocation flags (e.g. Fix 1.3's MA_TRANSCRIPTION_DONE) without touching
+    the module-level environment."""
+    import copy
+
+    env: dict | None = None
+    if extra_env:
+        env = copy.copy(os.environ)
+        env.update(extra_env)
+
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        env=env,
     )
     stdout, _ = await proc.communicate()
     return proc.returncode, (stdout or b"").decode(errors="replace")
 
 
-async def run_pipeline(session_id: str, auto_accept: bool = False):
-    global processing, pipeline_error
+async def run_pipeline(session_id: str, auto_accept: bool = False, whisper_model: str | None = None):
+    global processing, pipeline_error, pipeline_stage
     pipeline_error = None
     """Orchestrate serve -> process -> agent-run -> (optional) auto-apply -> shutdown serve"""
     # Check if an LLM server is already listening on the configured port.
@@ -358,24 +862,81 @@ async def run_pipeline(session_id: str, auto_accept: bool = False):
         pass
 
     serve_proc = None
+    serve_log = None
     if llm_already_running:
         logger.info("[%s] LLM server already running on port %s — reusing.", session_id, llm_port)
     else:
-        logger.info("[%s] Starting LLM Server...", session_id)
-        serve_proc = subprocess.Popen([sys.executable, "-m", "cli.main", "serve"])
+        # Spawned here (non-blocking) but NOT awaited yet -- Whisper transcription
+        # below has no dependency on the LLM server, so gating it behind LLM
+        # readiness only added latency for no reason. Starting the subprocess now
+        # lets its cold-load happen in parallel with transcription; we only block
+        # on _wait_for_llm_ready right before the one step that actually needs it
+        # (agent-run / extraction).
+        logger.info("[%s] Starting LLM Server (in parallel with transcription)...", session_id)
+        serve_proc, serve_log = _spawn_serve_subprocess_with_log()
 
     try:
-        await _wait_for_llm_ready(settings.llm.startup_timeout_seconds)
-
-        # 2. Process (transcribe)
+        # 2. Process (transcribe) -- Whisper only, no LLM server dependency.
+        pipeline_stage = "TRANSCRIBING"
         logger.info("[%s] Transcribing audio...", session_id)
-        code, out = await _run_subprocess([sys.executable, "-m", "cli.main", "process", "--session-id", session_id])
+        process_args = [sys.executable, "-m", "cli.main", "process", "--session-id", session_id]
+        if whisper_model:
+            process_args += ["--whisper-model", whisper_model]
+        code, out = await _run_subprocess(process_args)
         if code != 0:
             raise Exception(f"Transcription failed: {out}")
 
-        # 3. Agent Run
+        # Best-effort calendar-event enrichment (architecture_v2.md §10) --
+        # never blocks or fails the pipeline. session_start is recovered from
+        # the session_id's own embedded "-YYYYMMDD-HHMMSS" timestamp (set at
+        # /api/record/start time) since this web-triggered flow does not go
+        # through mcp_server.tools.recording.start_meeting (which is the only
+        # code path that would otherwise record a RECORDING history entry).
+        try:
+            from cli.calendar_matcher import match_calendar_event, save_calendar_match
+            from mcp_server.state import load_session_state
+
+            state_dir = Path(settings.paths.data_dir) / "state"
+            ts_match = re.search(r"-(\d{8})-(\d{6})$", session_id)
+            session_state = load_session_state(state_dir, session_id)
+            stopped_at = next((h["at"] for h in session_state.history if h["state"] == "STOPPED"), None)
+            if ts_match and stopped_at:
+                session_start = datetime.strptime(f"{ts_match.group(1)}{ts_match.group(2)}", "%Y%m%d%H%M%S")
+                session_end = datetime.fromisoformat(stopped_at).replace(tzinfo=None)
+                calendar_cache = Path(settings.paths.data_dir) / "calendar.json"
+                event = match_calendar_event(session_start, session_end, calendar_cache)
+                if event:
+                    save_calendar_match(
+                        session_id, state_dir, settings.concurrency.lock_path,
+                        settings.concurrency.lock_timeout_seconds, event,
+                    )
+                    logger.info("[%s] Matched calendar event: %s", session_id, event.get("subject"))
+        except Exception as exc:  # noqa: BLE001 - best-effort enrichment only
+            logger.warning("[%s] Calendar event matching failed (non-fatal): %s", session_id, exc)
+
+        # 3. LLM readiness gate -- deliberately placed here, immediately before the
+        # one step that actually needs the LLM server, not before recording/
+        # transcription (see the comment where serve_proc is spawned above).
+        if not llm_already_running:
+            pipeline_stage = "LLM_LOADING"
+        try:
+            await _wait_for_llm_ready(settings.llm.startup_timeout_seconds, serve_proc, serve_log)
+        except (RuntimeError, TimeoutError) as exc:
+            raise Exception(
+                f"LLM server unavailable — transcription saved at "
+                f"data/meetings/{session_id}.md. You can retry extraction later with: "
+                f"meeting-agent agent-run --session-id {session_id} "
+                f"(once the LLM server is confirmed healthy). Underlying error: {exc}"
+            )
+
+        # 4. Agent Run — Fix 1.3: signal that transcription is already done so
+        # the agent does not attempt to re-transcribe via transcribe_meeting.
+        pipeline_stage = "EXTRACTING"
         logger.info("[%s] Running agent...", session_id)
-        code, out = await _run_subprocess([sys.executable, "-m", "cli.main", "agent-run", "--session-id", session_id])
+        code, out = await _run_subprocess(
+            [sys.executable, "-m", "cli.main", "agent-run", "--session-id", session_id],
+            extra_env={"MA_TRANSCRIPTION_DONE": "1"},
+        )
         if code != 0:
             raise Exception(f"Agent processing failed: {out}")
 
@@ -399,6 +960,7 @@ async def run_pipeline(session_id: str, auto_accept: bool = False):
                     ReviewDecision(
                         id=item.id, decision="accept", description=item.description,
                         owner=item.owner, due_date=item.due_date, session_id=item.session_id,
+                        priority=item.priority,
                     )
                     for item in pending_items
                 ]
@@ -420,17 +982,25 @@ async def run_pipeline(session_id: str, auto_accept: bool = False):
                     todo_path = Path(settings.paths.data_dir) / "todo.md"
                     data_dir = Path(settings.paths.data_dir)
                     try:
-                        apply_reviewed_update(
+                        # apply_reviewed_update -> cli.git_backup.commit_all/ensure_repo
+                        # uses a blocking subprocess.run internally (git commit); offloaded
+                        # to a thread so it doesn't block the event loop, same rationale
+                        # as _run_subprocess above for the process/agent-run steps.
+                        await asyncio.to_thread(
+                            apply_reviewed_update,
                             token, session_id, pending_dir, todo_path, data_dir, state_dir,
                             settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
                         )
                     except (InvalidTransitionError, TodoFileUnparsableError) as exc:
                         raise Exception(f"Apply failed: {exc}")
         else:
+            pipeline_stage = "AWAITING_REVIEW"
             logger.info("[%s] Extraction complete -- items awaiting human review in data/pending_review/.", session_id)
     except Exception as e:
-        logger.error("[%s] Error in pipeline: %s", session_id, e)
+        pipeline_stage = "ERROR"
+        logger.error("[%s] Error in pipeline: %s", session_id, e, exc_info=True)
         pipeline_error = str(e)
+        _fail_session_best_effort(session_id, e)
     finally:
         if serve_proc is not None:
             # Only stop the server if we started it; if it was already running
@@ -443,7 +1013,16 @@ async def run_pipeline(session_id: str, auto_accept: bool = False):
                 serve_proc.kill()
         else:
             logger.info("[%s] LLM server was pre-existing — left running.", session_id)
+        # SB-2.1: ensure active_session_id and recording_processes are cleared even
+        # if stop_recording() wasn't the code path that triggered this pipeline run
+        # (e.g. run_extraction_only, a retry, or an unexpected call order).
+        global active_session_id, recording_processes
+        if active_session_id == session_id:
+            active_session_id = None
+            recording_processes = []
         processing = False
+        if pipeline_stage not in ("AWAITING_REVIEW", "ERROR"):
+            pipeline_stage = None
         logger.info("[%s] Pipeline complete.", session_id)
 
 # ── Review / Apply endpoints ──────────────────────────────────────────────────
@@ -475,14 +1054,30 @@ async def get_review_pending():
             items = load_pending_items(draft_path)
         except FileNotFoundError:
             items = []
+        # Fix 3.3: load quality metadata from session state for the review UI.
+        quality_label = None
+        quality_score = None
+        quality_flags: list = []
+        try:
+            from mcp_server.state import load_session_state as _load_ss
+            sess_state = _load_ss(state_dir, session_id)
+            quality_label = sess_state.metadata.get("quality_label")
+            quality_score = sess_state.metadata.get("quality_score")
+            quality_flags = sess_state.metadata.get("quality_flags") or []
+        except FileNotFoundError:
+            pass
         result.append({
             "session_id": session_id,
+            "quality_label": quality_label,
+            "quality_score": quality_score,
+            "quality_flags": quality_flags,
             "items": [
                 {
                     "id": item.id,
                     "description": item.description,
                     "owner": item.owner,
                     "due_date": item.due_date,
+                    "priority": item.priority,
                 }
                 for item in items
             ],
@@ -502,6 +1097,8 @@ class ReviewItemDecision(BaseModel):
     description: str
     owner: str | None = None
     due_date: str | None = None
+    priority: str | None = None
+    rejection_reason: str | None = None  # Fix 3.4: optional reason for rejections
 
 
 class ReviewDecideRequest(BaseModel):
@@ -515,11 +1112,23 @@ async def post_review_decide(req: ReviewDecideRequest):
 
     Calls complete_review() exactly as cli/main.py's `review` command does —
     no transition logic is reimplemented here."""
-    from cli.review_apply import ReviewDecision, complete_review
+    from cli.review_apply import ReviewDecision, complete_review, load_pending_items as _load_pending
     from mcp_server.state import InvalidTransitionError
 
     state_dir = Path(settings.paths.data_dir) / "state"
     pending_review_dir = Path(settings.paths.data_dir) / "pending_review"
+
+    # Fix 3.4 (record_edit): snapshot original descriptions NOW, before
+    # complete_review() renames/moves the pending draft.  Used later to detect
+    # description changes the user made before accepting, so each correction
+    # is written to data/feedback/edits.jsonl as a training signal.
+    _draft_path = pending_review_dir / f"{req.session_id}.md"
+    _original_descriptions: dict[str, str] = {}
+    try:
+        for _orig_item in _load_pending(_draft_path):
+            _original_descriptions[_orig_item.id] = _orig_item.description or ""
+    except Exception:  # noqa: BLE001 - best-effort; never blocks the review
+        pass
 
     decisions = [
         ReviewDecision(
@@ -529,6 +1138,7 @@ async def post_review_decide(req: ReviewDecideRequest):
             owner=d.owner,
             due_date=d.due_date,
             session_id=req.session_id,
+            priority=d.priority,
         )
         for d in req.decisions
     ]
@@ -546,6 +1156,51 @@ async def post_review_decide(req: ReviewDecideRequest):
         return JSONResponse({"error": str(exc)}, status_code=409)
     except FileNotFoundError as exc:
         return JSONResponse({"error": str(exc)}, status_code=404)
+
+    # Fix 3.4: record rejections as feedback for future extraction prompts.
+    from cli.feedback import record_rejection as _record_rejection
+
+    feedback_dir = Path(settings.paths.data_dir) / "feedback"
+    meeting_type_str = ""
+    try:
+        from mcp_server.state import load_session_state as _load_ss2
+        _ss = _load_ss2(state_dir, req.session_id)
+        meeting_type_str = _ss.metadata.get("meeting_type", "")
+    except FileNotFoundError:
+        pass
+    for d in req.decisions:
+        if d.decision == "reject":
+            try:
+                _record_rejection(
+                    session_id=req.session_id,
+                    item_id=d.id,
+                    item_description=d.description,
+                    rejection_reason=d.rejection_reason or "",
+                    feedback_dir=feedback_dir,
+                    meeting_type=meeting_type_str,
+                )
+            except Exception as exc:  # noqa: BLE001 - feedback is best-effort
+                logger.warning("Failed to record rejection for item %s: %s", d.id, exc)
+
+    # Fix 3.4 (record_edit): for accepted items whose description was edited by
+    # the user before submitting, write a correction record so future extraction
+    # prompts can reference real human rewrites as few-shot examples.
+    from cli.feedback import record_edit as _record_edit
+    for d in req.decisions:
+        if d.decision == "accept":
+            original = _original_descriptions.get(d.id, "")
+            if original and d.description and d.description != original:
+                try:
+                    _record_edit(
+                        session_id=req.session_id,
+                        item_id=d.id,
+                        original=original,
+                        corrected=d.description,
+                        feedback_dir=feedback_dir,
+                        meeting_type=meeting_type_str,
+                    )
+                except Exception as exc:  # noqa: BLE001 - feedback is best-effort
+                    logger.warning("Failed to record edit for item %s: %s", d.id, exc)
 
     return JSONResponse({
         "session_id": req.session_id,
@@ -578,7 +1233,10 @@ async def post_review_apply(req: ReviewApplyRequest):
 
     token = mint_capability_token()
     try:
-        result = apply_reviewed_update(
+        # Offloaded to a thread: apply_reviewed_update -> cli.git_backup's
+        # commit_all/ensure_repo use a blocking subprocess.run internally.
+        result = await asyncio.to_thread(
+            apply_reviewed_update,
             token,
             req.session_id,
             pending_review_dir,
@@ -619,7 +1277,8 @@ async def search_meetings_endpoint(q: str = ""):
         return JSONResponse({"results": []})
 
     meetings_dir = Path(settings.paths.data_dir) / "meetings"
-    results = search_meetings(meetings_dir, q.strip())
+    state_dir = Path(settings.paths.data_dir) / "state"
+    results = search_meetings(meetings_dir, q.strip(), state_dir=state_dir)
     return JSONResponse(jsonable_encoder({
         "results": [
             {
@@ -665,12 +1324,85 @@ async def get_meeting_detail(session_id: str):
         except json.JSONDecodeError:
             return None
 
+    # Calendar-link metadata (architecture_v2.md §10 / bugfix-01 Fix 5.4) --
+    # best-effort: a session may not have state yet (e.g. mid-recording), or may
+    # never have been matched to a calendar event.
+    calendar_subject = None
+    calendar_start = None
+    calendar_organiser = None
+    try:
+        from mcp_server.state import load_session_state
+
+        state_dir = Path(settings.paths.data_dir) / "state"
+        session_state = load_session_state(state_dir, session_id)
+        calendar_subject = session_state.metadata.get("calendar_subject") or session_state.metadata.get("calendar_event_subject")
+        calendar_start = session_state.metadata.get("calendar_start") or session_state.metadata.get("calendar_event_start")
+        calendar_organiser = session_state.metadata.get("calendar_organiser") or session_state.metadata.get("calendar_event_organiser")
+    except FileNotFoundError:
+        pass
+
     return JSONResponse({
         "session_id": session_id,
         "transcript": read_opt(transcript_path),
         "summary": read_opt(meetings_dir / f"{session_id}.summary.md"),
         "actions": read_json_opt(meetings_dir / f"{session_id}.actions.json"),
         "highlights": read_json_opt(meetings_dir / f"{session_id}.highlights.json"),
+        "mom_content": read_opt(meetings_dir / f"{session_id}.mom.md"),
+        "calendar_subject": calendar_subject,
+        "calendar_start": calendar_start,
+        "calendar_organiser": calendar_organiser,
+    })
+
+
+def _calendar_event_id(event: dict) -> str:
+    """Derive a stable id for a calendar.json event (the cache has no native id
+    field). Hash of subject+date+start -- stable across re-syncs as long as the
+    event itself doesn't change, good enough to round-trip a selection from the
+    frontend back to the same event server-side without changing calendar.json's
+    storage format."""
+    import hashlib
+
+    raw = f"{event.get('subject', '')}|{event.get('date', '')}|{event.get('start', '')}"
+    return hashlib.sha1(raw.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
+
+
+@app.get("/api/calendar/events")
+async def get_calendar_events(date: str):
+    """List cached calendar events near `date` (YYYY-MM-DD), for the transcript-
+    upload calendar-link picker. Never raises on a missing/malformed cache --
+    calendar linking is optional enrichment, not a hard dependency."""
+    from datetime import timedelta as _timedelta
+
+    calendar_cache = Path(settings.paths.data_dir) / "calendar.json"
+    if not calendar_cache.exists():
+        return JSONResponse({"events": [], "date": date})
+
+    try:
+        target = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        return JSONResponse({"error": f"Invalid date {date!r}, expected YYYY-MM-DD."}, status_code=422)
+
+    try:
+        events = json.loads(calendar_cache.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return JSONResponse({"events": [], "date": date})
+
+    window = {(target - _timedelta(days=1)).isoformat(), target.isoformat(), (target + _timedelta(days=1)).isoformat()}
+    matched = [e for e in events if e.get("date") in window]
+
+    return JSONResponse({
+        "events": [
+            {
+                "id": _calendar_event_id(e),
+                "subject": e.get("subject"),
+                "date": e.get("date"),
+                "start": e.get("start"),
+                "end": e.get("end"),
+                "organiser": e.get("organizer") or e.get("organiser"),
+            }
+            for e in matched
+        ],
+        "date": date,
     })
 
 
@@ -708,6 +1440,7 @@ async def server_status():
         "llm_port": llm_port,
         "recording": bool(recording_processes and any(p.poll() is None for p in recording_processes)),
         "processing": processing,
+        "pipeline_stage": pipeline_stage,
         "active_session": active_session_id,
     })
 
@@ -778,7 +1511,6 @@ async def restart_web_server():
 async def reset_all_data():
     """Delete all meeting records, session state, pending reviews, and empty
     todo.md.  Intended for clearing test/demo data; irreversible."""
-    import shutil
     data_dir = Path(settings.paths.data_dir)
     cleared = {}
     for subdir in ["meetings", "state", "pending_review"]:
@@ -795,6 +1527,182 @@ async def reset_all_data():
         todo_path.write_text("")
         cleared["todo"] = "cleared"
     return JSONResponse({"status": "ok", "cleared": cleared})
+
+
+# ── AI reasoning: recurring blockers + weekly digest ────────────────────────────
+
+@app.get("/api/blockers/recurring")
+async def get_recurring_blockers():
+    """Reads data/recurring_blockers.json (written best-effort after each
+    IS-call extraction). Returns an empty list if it does not exist yet."""
+    path = Path(settings.paths.data_dir) / "recurring_blockers.json"
+    if not path.exists():
+        return JSONResponse({"blockers": [], "last_updated": None})
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return JSONResponse(data)
+
+
+@app.get("/api/summary/weekly")
+async def get_weekly_summary(days: int = 7):
+    """User-initiated weekly digest (never auto-run). Serves the cached
+    result if younger than 6h, else generates a fresh one via the local LLM."""
+    from cli.weekly_summary import generate_weekly_summary, load_cached_weekly_summary
+
+    meetings_dir = Path(settings.paths.data_dir) / "meetings"
+    state_dir = Path(settings.paths.data_dir) / "state"
+
+    cached = load_cached_weekly_summary(meetings_dir)
+    if cached:
+        return JSONResponse(cached)
+
+    from llm.client import HttpLLMClient
+
+    llm_client = HttpLLMClient(base_url=f"http://{settings.llm.host}:{settings.llm.port}")
+    try:
+        summary = await asyncio.to_thread(generate_weekly_summary, meetings_dir, state_dir, llm_client.complete, days)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the UI, not a pipeline failure
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+    cached = load_cached_weekly_summary(meetings_dir)
+    return JSONResponse(cached or {"summary": summary, "generated_at": None, "session_count": None})
+
+
+# ── Settings ───────────────────────────────────────────────────────────────────
+
+@app.get("/api/settings")
+async def get_settings():
+    """Read-only subset of settings.toml the UI needs (Settings panel)."""
+    return JSONResponse({
+        "whisper_model": settings.whisper.model,
+        "diarisation_enabled": settings.whisper.diarisation_enabled,
+    })
+
+
+class SettingsPatchRequest(BaseModel):
+    whisper_model: str | None = None
+
+
+@app.patch("/api/settings")
+async def patch_settings(req: SettingsPatchRequest):
+    """Update a narrow, known-safe subset of settings.toml (currently just
+    [whisper].model). Uses a targeted regex substitution rather than a full
+    tomllib-parse + re-serialise round trip, since Python's stdlib TOML
+    support is read-only and a full rewrite would silently drop comments in
+    a file the user may hand-edit -- see architecture_v2.md deviation notes."""
+    if req.whisper_model is None:
+        return JSONResponse({"status": "no_changes"})
+
+    valid_models = {"base", "small", "large-v3"}
+    if req.whisper_model not in valid_models:
+        return JSONResponse({"error": f"whisper_model must be one of {sorted(valid_models)}"}, status_code=422)
+
+    text = DEFAULT_SETTINGS_PATH.read_text(encoding="utf-8")
+    new_text, count = re.subn(
+        r'(\[whisper\][^\[]*?\bmodel\s*=\s*)"[^"]*"',
+        lambda m: f'{m.group(1)}"{req.whisper_model}"',
+        text, count=1, flags=re.DOTALL,
+    )
+    if count == 0:
+        return JSONResponse({"error": "Could not locate [whisper].model in settings.toml"}, status_code=500)
+
+    tmp_path = DEFAULT_SETTINGS_PATH.with_suffix(".toml.tmp")
+    tmp_path.write_text(new_text, encoding="utf-8")
+    tmp_path.replace(DEFAULT_SETTINGS_PATH)
+
+    global settings
+    settings = load_settings(DEFAULT_SETTINGS_PATH)
+    return JSONResponse({"status": "saved", "whisper_model": settings.whisper.model})
+
+
+# ── Manual task entry / status tracking (architecture_v2.md §Phase 7.2) ─────────
+
+class ManualTaskRequest(BaseModel):
+    description: str
+    due_date: str | None = None
+    priority: str = "MEDIUM"
+    tag: str | None = None
+    progress_note: str | None = None
+
+
+@app.post("/api/tasks/manual")
+async def create_manual_task(req: ManualTaskRequest):
+    from cli.capability import mint_capability_token
+    from cli.review_apply import write_manual_task
+
+    description = req.description.strip()
+    if not description or len(description) > 500:
+        return JSONResponse({"error": "description must be non-empty and at most 500 characters."}, status_code=422)
+    if req.priority not in {"HIGH", "MEDIUM", "LOW"}:
+        return JSONResponse({"error": "priority must be one of HIGH/MEDIUM/LOW."}, status_code=422)
+    if req.tag and len(req.tag) > 50:
+        return JSONResponse({"error": "tag must be at most 50 characters."}, status_code=422)
+    if req.progress_note and len(req.progress_note) > 200:
+        return JSONResponse({"error": "progress_note must be at most 200 characters."}, status_code=422)
+
+    todo_path = Path(settings.paths.data_dir) / "todo.md"
+    token = mint_capability_token()
+    task_id = write_manual_task(
+        token,
+        {"description": description, "due_date": req.due_date, "priority": req.priority,
+         "tag": req.tag, "progress_note": req.progress_note},
+        todo_path, settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
+    )
+    return JSONResponse({"task_id": task_id, "status": "created"})
+
+
+class TaskPatchRequest(BaseModel):
+    status: str | None = None
+    due_date: str | None = None
+    progress_note: str | None = None
+    priority: str | None = None
+
+
+_VALID_TASK_STATUSES = {"todo", "in_progress", "done", "blocked"}
+
+
+@app.patch("/api/tasks/{task_id}")
+async def patch_task(task_id: str, req: TaskPatchRequest):
+    from cli.capability import mint_capability_token
+    from cli.review_apply import update_task_status
+
+    if req.status is not None and req.status not in _VALID_TASK_STATUSES:
+        return JSONResponse({"error": f"status must be one of {sorted(_VALID_TASK_STATUSES)}"}, status_code=422)
+
+    todo_path = Path(settings.paths.data_dir) / "todo.md"
+    updates = {
+        "status": req.status, "due_date": req.due_date,
+        "progress_note": req.progress_note, "priority": req.priority,
+    }
+    token = mint_capability_token()
+    try:
+        update_task_status(
+            token, task_id, updates, todo_path,
+            settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
+        )
+    except KeyError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+
+    updated_fields = [k for k, v in updates.items() if v is not None]
+    return JSONResponse({"task_id": task_id, "updated_fields": updated_fields})
+
+
+@app.delete("/api/tasks/{task_id}")
+async def delete_task(task_id: str):
+    """Soft delete: marks status="deleted" and keeps the record in todo.md
+    for history/audit, rather than removing the line."""
+    from cli.capability import mint_capability_token
+    from cli.review_apply import update_task_status
+
+    todo_path = Path(settings.paths.data_dir) / "todo.md"
+    token = mint_capability_token()
+    try:
+        update_task_status(
+            token, task_id, {"status": "deleted"}, todo_path,
+            settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
+        )
+    except KeyError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    return JSONResponse({"task_id": task_id, "status": "deleted"})
 
 
 # ── Todo complete ──────────────────────────────────────────────────────────────

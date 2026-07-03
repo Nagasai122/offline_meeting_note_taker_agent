@@ -170,8 +170,6 @@ def transcribe_dual_track(
 ) -> Path:
     """Orchestrates dual-track transcription (Mic + Loopback). Returns the path to the
     written transcript on success. Always deletes the source WAVs and their sidecars."""
-    import json
-    import dataclasses
     
     tmp_dir = Path(tmp_dir)
     mic_wav = tmp_dir / f"{session_id}-mic.wav"

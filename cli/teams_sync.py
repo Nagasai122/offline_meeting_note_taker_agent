@@ -23,8 +23,7 @@ def fetch_outlook_calendar(output_path: Path) -> int:
 
     # Date range for today
     today = datetime.date.today()
-    tomorrow = today + datetime.timedelta(days=1)
-    
+
     # Format dates for Outlook Restrict method
     start_str = (today - datetime.timedelta(days=1)).strftime("%m/%d/%Y 00:00")
     end_str = (today + datetime.timedelta(days=7)).strftime("%m/%d/%Y 00:00")

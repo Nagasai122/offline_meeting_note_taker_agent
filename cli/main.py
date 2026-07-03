@@ -18,7 +18,7 @@ from audio_capture.device_probe import format_devices, list_all_devices
 from audio_capture.session_buffer import SessionBuffer, sweep_orphaned_audio
 from audio_capture.sources import SourceKind, get_source
 from config.loader import load_settings
-from llm.model_profiles import get_profile, resolve_weights_path
+from llm.model_profiles import get_profile
 from llm.server_manager import start_server
 from transcribe.whisper_runner import transcribe_meeting
 
@@ -188,6 +188,15 @@ def process(
     diarisation: bool = typer.Option(
         None, help="Override whisper.diarisation_enabled from settings.toml for this run"
     ),
+    whisper_model: str = typer.Option(
+        None, help="Override whisper.model from settings.toml for this session only (e.g. base/small/large-v3)"
+    ),
+    skip_transcribe: bool = typer.Option(
+        False, "--skip-transcribe",
+        help="Skip Whisper transcription and reuse the existing data/meetings/<session_id>.md "
+             "transcript. Recovery path for when transcription already succeeded but a later "
+             "step (e.g. extraction) failed -- avoids re-running Whisper unnecessarily.",
+    ),
     settings_path: Path = typer.Option(DEFAULT_SETTINGS_PATH),
 ) -> None:
     """
@@ -202,47 +211,75 @@ def process(
     diarisation_enabled = (
         diarisation if diarisation is not None else settings.whisper.diarisation_enabled
     )
+    model_size = whisper_model or settings.whisper.model
+    meetings_dir = Path(settings.paths.data_dir) / "meetings"
 
-    tmp_dir = Path(settings.paths.tmp_dir)
-    loop_wav = tmp_dir / f"{session_id}-loop.wav"
-    
-    if loop_wav.exists():
-        # Dual-track recording detected
-        from transcribe.whisper_runner import transcribe_dual_track
-        transcript_path = transcribe_dual_track(
-            session_id=session_id,
-            tmp_dir=tmp_dir,
-            meetings_dir=Path(settings.paths.data_dir) / "meetings",
-            model_size=settings.whisper.model,
-            device=settings.whisper.device,
-            compute_type=settings.whisper.compute_type,
-        )
+    if skip_transcribe:
+        transcript_path = meetings_dir / f"{session_id}.md"
+        if not transcript_path.exists():
+            typer.echo(
+                f"--skip-transcribe given but no transcript found at {transcript_path}.", err=True
+            )
+            raise typer.Exit(code=1)
+        typer.echo(f"Skipping transcription; using existing transcript: {transcript_path}")
     else:
-        # Legacy single-track recording
-        transcript_path = transcribe_meeting(
-            session_id=session_id,
-            tmp_dir=tmp_dir,
-            meetings_dir=Path(settings.paths.data_dir) / "meetings",
-            model_size=settings.whisper.model,
-            device=settings.whisper.device,
-            compute_type=settings.whisper.compute_type,
-            diarisation_enabled=diarisation_enabled,
-        )
-    typer.echo(f"Transcript written: {transcript_path}")
-    typer.echo("Source audio deleted.")
+        tmp_dir = Path(settings.paths.tmp_dir)
+        loop_wav = tmp_dir / f"{session_id}-loop.wav"
+
+        if loop_wav.exists():
+            # Dual-track recording detected
+            from transcribe.whisper_runner import transcribe_dual_track
+            transcript_path = transcribe_dual_track(
+                session_id=session_id,
+                tmp_dir=tmp_dir,
+                meetings_dir=meetings_dir,
+                model_size=model_size,
+                device=settings.whisper.device,
+                compute_type=settings.whisper.compute_type,
+            )
+        else:
+            # Legacy single-track recording
+            transcript_path = transcribe_meeting(
+                session_id=session_id,
+                tmp_dir=tmp_dir,
+                meetings_dir=meetings_dir,
+                model_size=model_size,
+                device=settings.whisper.device,
+                compute_type=settings.whisper.compute_type,
+                diarisation_enabled=diarisation_enabled,
+            )
+        typer.echo(f"Transcript written: {transcript_path}")
+        typer.echo("Source audio deleted.")
 
     # Advance the state
     from mcp_server import state as state_mod
+    from mcp_server.meeting_type import load_meeting_type, type_file_path
     state_dir = Path(settings.paths.data_dir) / "state"
     lock_path = Path(settings.concurrency.lock_path)
     lock_timeout = settings.concurrency.lock_timeout_seconds
     state_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        state_mod.load_session_state(state_dir, session_id)
-    except FileNotFoundError:
-        state_mod.create_session(state_dir, session_id, lock_path, lock_timeout, initial_state=state_mod.State.STOPPED)
 
-    state_mod.transition(state_dir, session_id, state_mod.State.TRANSCRIBED, lock_path, lock_timeout, transcript_path=str(transcript_path))
+    detected_type = load_meeting_type(type_file_path(meetings_dir, session_id))
+    try:
+        existing = state_mod.load_session_state(state_dir, session_id)
+    except FileNotFoundError:
+        existing = None
+        state_mod.create_session(
+            state_dir, session_id, lock_path, lock_timeout, initial_state=state_mod.State.STOPPED,
+            meeting_type=detected_type.value,
+        )
+
+    if existing is not None and existing.state == state_mod.State.TRANSCRIBED:
+        # Already at TRANSCRIBED (the exact --skip-transcribe recovery case) --
+        # TRANSCRIBED -> TRANSCRIBED is not a valid transition() edge, and there
+        # is nothing new to record, so this is a deliberate no-op rather than an
+        # error.
+        typer.echo(f"Session '{session_id}' is already TRANSCRIBED; nothing to advance.")
+    else:
+        state_mod.transition(
+            state_dir, session_id, state_mod.State.TRANSCRIBED, lock_path, lock_timeout,
+            transcript_path=str(transcript_path), whisper_model=model_size,
+        )
 
 @app.command(name="mcp-serve")
 def mcp_serve(settings_path: Path = DEFAULT_SETTINGS_PATH) -> None:
@@ -277,6 +314,7 @@ def agent_run(
     tools it calls) a draft under data/pending_review/ -- never data/todo.md.
     """
     import asyncio
+    import os
 
     from agent.loop import AgentLoop, MaxIterationsExceededError
     from agent.mcp_client import AgentMCPClient
@@ -285,6 +323,16 @@ def agent_run(
     settings = load_settings(settings_path)
     llm_client = HttpLLMClient(base_url=f"http://{settings.llm.host}:{settings.llm.port}")
 
+    # Fix 1.3: if the pipeline orchestrator already ran transcription before
+    # spawning this subprocess, it sets MA_TRANSCRIPTION_DONE=1.  Hide
+    # transcribe_meeting from the agent's tool catalogue so it cannot call it
+    # even if the system-prompt dispatch table or the tool-level state guard
+    # were somehow bypassed (defence-in-depth, three layers total).
+    _filter: frozenset[str] = frozenset()
+    if os.environ.get("MA_TRANSCRIPTION_DONE") == "1":
+        _filter = frozenset({"transcribe_meeting"})
+        logger.debug("MA_TRANSCRIPTION_DONE set — transcribe_meeting hidden from agent tool list")
+
     async def _main() -> None:
         async with AgentMCPClient(settings_path) as mcp_client:
             loop = AgentLoop(
@@ -292,6 +340,7 @@ def agent_run(
                 mcp_client=mcp_client,
                 trace_dir=settings.agent.trace_dir,
                 max_iterations=settings.agent.max_iterations,
+                filter_tools=_filter,
             )
             try:
                 result = await loop.run(session_id)
@@ -337,13 +386,14 @@ def review(
     typer.echo(f"Reviewing {len(items)} proposed item(s) for session '{session_id}':\n")
     decisions: list[ReviewDecision] = []
     for item in items:
-        typer.echo(f"  - {item.description}  (owner={item.owner!r}, due={item.due_date!r})")
+        typer.echo(f"  - {item.description}  (owner={item.owner!r}, due={item.due_date!r}, priority={item.priority!r})")
         accept = typer.confirm("    Accept this item?", default=True)
         if not accept:
             decisions.append(
                 ReviewDecision(
                     id=item.id, decision="reject", description=item.description,
                     owner=item.owner, due_date=item.due_date, session_id=item.session_id,
+                    priority=item.priority,
                 )
             )
             continue
@@ -359,6 +409,7 @@ def review(
             ReviewDecision(
                 id=item.id, decision="accept", description=description,
                 owner=owner, due_date=due_date, session_id=item.session_id,
+                priority=item.priority,
             )
         )
 
@@ -508,13 +559,115 @@ def sync_calendar(
     typer.echo(f"Successfully synced {count} meeting(s) to {calendar_cache}")
 
 
+@app.command(name="import-transcript")
+def import_transcript(
+    session_id: str = typer.Option(..., help="Session identifier to use (must not already exist)"),
+    file: Path = typer.Option(..., help="Transcript file (.json, .vtt, .srt, .txt)"),
+    meeting_type: str = typer.Option(
+        "project-meeting", "--type", help="One of: is-call, project-meeting, seminar, general"
+    ),
+    whisper_model: str = typer.Option(
+        None, help="Recorded in metadata as the transcription source; defaults to 'imported'"
+    ),
+    settings_path: Path = typer.Option(DEFAULT_SETTINGS_PATH),
+) -> None:
+    """
+    Import an externally-produced transcript directly at TRANSCRIBED, bypassing
+    RECORDING/STOPPED entirely (architecture_v2.md §8). Supports Whisper JSON,
+    WebVTT, SRT, and plain text.
+    """
+    from mcp_server import state as state_mod
+    from mcp_server.meeting_type import MeetingType, type_file_path
+    from transcribe.import_parsers import parse_transcript_file
+    from transcribe.postprocess import write_transcript
+    from transcribe.whisper_runner import TranscriptionResult, TranscriptSegment
+
+    if not file.exists():
+        typer.echo(f"Transcript file not found: {file}", err=True)
+        raise typer.Exit(code=1)
+    if file.suffix.lower() not in {".json", ".vtt", ".srt", ".txt"}:
+        typer.echo(f"Unsupported transcript extension: {file.suffix!r}", err=True)
+        raise typer.Exit(code=1)
+    try:
+        MeetingType(meeting_type)
+    except ValueError:
+        typer.echo(f"Invalid --type {meeting_type!r}. Must be one of: is-call, project-meeting, seminar, general.", err=True)
+        raise typer.Exit(code=1)
+
+    settings = load_settings(settings_path)
+    state_dir = Path(settings.paths.data_dir) / "state"
+    meetings_dir = Path(settings.paths.data_dir) / "meetings"
+    lock_path = Path(settings.concurrency.lock_path)
+    lock_timeout = settings.concurrency.lock_timeout_seconds
+    state_dir.mkdir(parents=True, exist_ok=True)
+    meetings_dir.mkdir(parents=True, exist_ok=True)
+
+    model_used = whisper_model or "imported"
+
+    state_mod.create_session(
+        state_dir, session_id, lock_path, lock_timeout, initial_state=state_mod.State.STOPPED,
+        meeting_type=meeting_type, source="import", whisper_model=model_used,
+    )
+    type_file_path(meetings_dir, session_id).write_text(meeting_type)
+
+    segments = parse_transcript_file(file)
+    result = TranscriptionResult(
+        session_id=session_id,
+        segments=[TranscriptSegment(**seg) for seg in segments],
+        language="unknown",
+        duration_seconds=segments[-1]["end"] if segments else 0.0,
+        model_name=model_used,
+        diarised=False,
+    )
+    write_transcript(meetings_dir, result)
+
+    state_mod.transition(
+        state_dir, session_id, state_mod.State.TRANSCRIBED, lock_path, lock_timeout,
+        transcript_path=str(meetings_dir / f"{session_id}.md"),
+    )
+
+    typer.echo(f"Import complete. Session: {session_id}")
+    typer.echo(f"Run `meeting-agent agent-run --session-id {session_id}` next to extract action items.")
+
+
+def _reminder_loop(data_dir: Path, todo_path: Path, interval_seconds: int = 3600) -> None:
+    """Daemon-thread body (not asyncio, so it never competes with the FastAPI
+    event loop): checks for due tasks immediately on startup, then hourly.
+    A single check's failure is logged and the loop continues -- one bad
+    todo.md parse must not silently stop reminders forever."""
+    import time
+
+    from cli.reminders import check_and_notify
+
+    check_and_notify(data_dir, todo_path)
+    while True:
+        time.sleep(interval_seconds)
+        try:
+            check_and_notify(data_dir, todo_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Reminder check failed: %s", exc)
+
+
 @app.command()
 def web(
     port: int = typer.Option(8000, help="Port to run the dashboard on"),
+    settings_path: Path = typer.Option(DEFAULT_SETTINGS_PATH),
 ) -> None:
     """Launch the Web Dashboard."""
+    import threading
+
     import uvicorn
+
     from cli.web import app as web_app
+
+    settings = load_settings(settings_path)
+    reminder_thread = threading.Thread(
+        target=_reminder_loop,
+        args=(Path(settings.paths.data_dir), Path(settings.paths.data_dir) / "todo.md"),
+        daemon=True,
+    )
+    reminder_thread.start()
+
     typer.echo(f"Starting Web Dashboard on http://localhost:{port}")
     uvicorn.run(web_app, host="127.0.0.1", port=port, log_level="info")
 
