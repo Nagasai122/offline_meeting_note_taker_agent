@@ -324,3 +324,90 @@ tests.
 added to the dev extra in pyproject.toml.
 
 **Strand C acceptance criteria: all four MET.**
+
+---
+
+## Strand D — Performance benchmarking
+
+### Plan (written before execution)
+
+1. Empirical baselines on the actual workstation (RTX 5090 Laptop 24GB,
+   driver 592.02): faster-whisper throughput per model size on real speech
+   audio (synthesised offline via Windows SAPI TTS — zero egress), and LLM
+   extraction latency through the project's own server_manager +
+   HttpLLMClient against the shipped qwen2_5_7b_gguf profile.
+2. Static + quantitative analysis of the chunked-extraction path.
+3. Written backend recommendation only — no dependency change.
+
+### Findings (2026-07-03)
+
+**D-1. Transcription baseline (8.6 min of 16kHz mono speech, beam_size=2,
+vad_filter=True, device=cuda, compute_type=int8_float16 — the shipped
+config; reproducible via `scripts/bench_pipeline.py`):**
+
+| model | load | transcribe | speed | 60-min meeting costs |
+|---|---|---|---|---|
+| base (shipped default) | 6.8s | 11.3s | 45.9x realtime | ~1.3 min |
+| medium | 2.7s | 19.8s | 26.1x realtime | ~2.3 min |
+| large-v3 | 5.1s | 60.4s | 8.6x realtime | ~7.0 min |
+
+Config drift noted: README presents `large-v3` as the reference model;
+`config/settings.toml` ships `model = "base"` ("changed from medium for
+faster execution"). Doc fix queued.
+
+**D-2. Extraction latency baseline (llama-server + Qwen2.5-7B GGUF, the
+shipped profile; real prompts built from the project's own project-meeting
+system prompt):**
+
+| prompt size | latency (warm) |
+|---|---|
+| ~1.6k est tokens (short meeting) | ~2.9s |
+| ~5.1k est tokens (full chunker-sized chunk) | ~3.5s |
+
+Plus one real production datapoint from data/state/: session
+news-20260702-145949, TRANSCRIBED→EXTRACTED in 8.2s (single-chunk path
+with chaining context). Extraction is NOT the pipeline bottleneck at any
+plausible meeting length: a 3-hour seminar ≈ 28k tokens ≈ 7 chunks ≈
+~25s of chunk calls + ~3s synthesis. Transcription dominates wall time.
+
+**D-3. Chunking-efficiency finding (documented, not changed):**
+1. No redundant *transcript* processing: overlap is 400/5000 tokens ≈ 8%
+   extra per chunk after the first, plus exactly one synthesis call over
+   the (small) merged summaries — both deliberate and proportionate.
+2. The real inefficiency is **context re-prefill**: `_extract_chunked`
+   sends the entire `full_system_prompt` (base prompt ~600 tok + todo.md
+   context + negative examples + chained prior sessions) with *every*
+   chunk, and `cache_prompt: False` (a deliberate SB-1.1 privacy choice in
+   llm/client.py) forces llama-server to re-prefill it each time. Cost
+   today: ~1–2s × n_chunks on this hardware — real but tolerable.
+3. **Bigger finding — context bomb in session chaining (flagged):**
+   `_load_prior_sessions` injects up to 3 prior sessions' FULL TRANSCRIPTS
+   (`<sid>.md`), not their summaries — architecture.md explicitly says
+   "chaining previous meeting summaries". Three 30-min prior meetings ≈
+   15k tokens of context, which can exceed the model context by itself and
+   silently starve the *current* transcript — the exact silent-truncation
+   bug class chunking was built to fix (Persona 2). Recommendation: read
+   `<sid>.summary.md` (fall back to truncated transcript) — behavioural
+   change to extraction quality, so queued for [HUMAN DECISION], not
+   applied.
+
+**D-4. Backend-swap recommendation (for [HUMAN DECISION]):**
+The market-survey premise is already banked: this project ALREADY runs
+faster-whisper (CTranslate2) — the "~4x faster than stock Whisper.cpp"
+class of gain is what D-1's numbers show. A Parakeet/NeMo swap would add a
+heavy new dependency tree with weak Windows support for, at best, low
+single-digit-x on a step that already runs 8.6–46x realtime *batch,
+after the meeting ends* — latency the user never sits in front of.
+**Recommendation: do not swap backends.** The two levers that matter:
+  1. Model choice: shipped `base` is fast but weak on technical/medical
+     vocabulary (code_review Personas 2/7). `distil-large-v3` (not
+     currently cached locally; would need a one-time network fetch, i.e. a
+     `setup` extension) gives near-large-v3 accuracy at roughly 2x its
+     speed and is the best accuracy/speed default for this hardware if
+     accuracy complaints recur. Zero code change — it's a config value.
+  2. Have `setup` pre-fetch the configured whisper model (closes A-5.3's
+     "first `process` run needs a warm HF cache" gap at the same time).
+
+**Strand D acceptance criteria:** baselines recorded — MET;
+chunking-efficiency finding documented — MET; backend recommendation
+produced, not implemented — MET (awaiting [HUMAN DECISION]).
