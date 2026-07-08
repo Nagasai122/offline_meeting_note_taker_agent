@@ -390,14 +390,32 @@
 
                     <div id="add-task-form" class="hidden glass-panel" style="padding: 1.25rem; margin-bottom: 1.25rem;">
                         <div class="form-row">
+                            <label class="field-label" for="new-task-title">Title (optional)</label>
+                            <input type="text" id="new-task-title" class="text-input" maxlength="200" placeholder="Short name shown on the task card">
+                        </div>
+                        <div class="form-row">
                             <label class="field-label" for="new-task-description">Description</label>
                             <textarea id="new-task-description" class="textarea-input" rows="2" maxlength="500"
                                       placeholder="What needs to be done?" oninput="_validateAddTaskForm()"></textarea>
                         </div>
                         <div style="display:flex; gap:1rem; flex-wrap:wrap;">
                             <div class="form-row" style="flex:1; min-width:140px;">
+                                <label class="field-label" for="new-task-owner">Owner</label>
+                                <input type="text" id="new-task-owner" class="text-input" maxlength="200" placeholder="Defaults to you">
+                            </div>
+                            <div class="form-row" style="flex:1; min-width:140px;">
+                                <label class="field-label" for="new-task-project">Project</label>
+                                <input type="text" id="new-task-project" class="text-input" maxlength="100" placeholder="e.g. proj-42">
+                            </div>
+                        </div>
+                        <div style="display:flex; gap:1rem; flex-wrap:wrap;">
+                            <div class="form-row" style="flex:1; min-width:140px;">
                                 <label class="field-label" for="new-task-due">Due date</label>
                                 <input type="date" id="new-task-due" class="text-input">
+                            </div>
+                            <div class="form-row" style="flex:1; min-width:140px;">
+                                <label class="field-label" for="new-task-reminder">Reminder date</label>
+                                <input type="date" id="new-task-reminder" class="text-input">
                             </div>
                             <div class="form-row" style="flex:1; min-width:140px;">
                                 <label class="field-label" for="new-task-priority">Priority</label>
@@ -408,12 +426,21 @@
                                 </select>
                             </div>
                             <div class="form-row" style="flex:1; min-width:140px;">
+                                <label class="field-label" for="new-task-status">Status</label>
+                                <select id="new-task-status" class="select-input">
+                                    <option value="todo" selected>To do</option>
+                                    <option value="in_progress">In progress</option>
+                                    <option value="blocked">Blocked</option>
+                                    <option value="done">Done</option>
+                                </select>
+                            </div>
+                            <div class="form-row" style="flex:1; min-width:140px;">
                                 <label class="field-label" for="new-task-tag">Tag</label>
                                 <input type="text" id="new-task-tag" class="text-input" maxlength="50" placeholder="e.g. WP3">
                             </div>
                         </div>
                         <div class="form-row">
-                            <label class="field-label" for="new-task-note">Progress note (optional)</label>
+                            <label class="field-label" for="new-task-note">Notes (optional)</label>
                             <input type="text" id="new-task-note" class="text-input" maxlength="200">
                         </div>
                         <div id="add-task-error" style="color:#a6432d; font-size:0.85rem; margin-bottom:0.5rem;"></div>
@@ -552,6 +579,10 @@
                         onclick="exportCurrentSessionToVault()">
                     <i class="fa-solid fa-file-export"></i> Export to vault
                 </button>
+                <button class="btn-secondary" style="padding:5px 14px;font-size:0.8rem;"
+                        onclick="exportCurrentSessionToDocx()">
+                    <i class="fa-solid fa-file-word"></i> Export to Word
+                </button>
                 <span id="modal-export-status" style="font-size:0.78rem;color:var(--text-muted);"></span>
             </div>
 
@@ -660,6 +691,115 @@
                     <i class="fa-solid fa-microphone"></i> Start Recording
                 </button>
                 <button class="btn-secondary" onclick="closePreMeetingModal()">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Task detail side panel (P1.5): full editable view of one task,
+         opened by clicking a task card in the Tasks tab. Slides in from the
+         right rather than a centered modal, since it stays open alongside
+         the task list behind it (matching the drawer pattern, distinct from
+         the centered meeting-detail/confirm modals above). -->
+    <div id="task-detail-overlay" class="hidden" style="position:fixed;inset:0;z-index:1100;background:rgba(43,42,40,0.35);" onclick="closeTaskDetail()"></div>
+    <div id="task-detail-panel" class="hidden" role="dialog" aria-modal="true" aria-labelledby="task-detail-title"
+         style="position:fixed;top:0;right:0;bottom:0;z-index:1101;width:420px;max-width:92vw;
+                background:var(--card);border-left:1px solid var(--hairline-strong);
+                box-shadow:-6px 0 16px rgba(43,42,40,0.15);overflow-y:auto;padding:1.5rem;">
+        <button onclick="closeTaskDetail()" aria-label="Close"
+                style="position:absolute;top:1rem;right:1rem;background:none;border:none;
+                       color:var(--text-muted);font-size:1.4rem;cursor:pointer;">&#x2715;</button>
+        <h2 id="task-detail-title" style="color:var(--primary);margin-bottom:1rem;padding-right:2rem;">Task</h2>
+
+        <div id="task-detail-error" style="color:#a6432d;font-size:0.85rem;margin-bottom:0.75rem;"></div>
+
+        <div class="form-row">
+            <label class="field-label" for="td-title">Title</label>
+            <input type="text" id="td-title" class="text-input" maxlength="200">
+        </div>
+        <div class="form-row">
+            <label class="field-label" for="td-description">Description</label>
+            <textarea id="td-description" class="textarea-input" rows="2" maxlength="500"></textarea>
+        </div>
+        <div style="display:flex; gap:1rem; flex-wrap:wrap;">
+            <div class="form-row" style="flex:1; min-width:140px;">
+                <label class="field-label" for="td-owner">Owner</label>
+                <input type="text" id="td-owner" class="text-input" maxlength="200">
+            </div>
+            <div class="form-row" style="flex:1; min-width:140px;">
+                <label class="field-label" for="td-project">Project</label>
+                <input type="text" id="td-project" class="text-input" maxlength="100">
+            </div>
+        </div>
+        <div style="display:flex; gap:1rem; flex-wrap:wrap;">
+            <div class="form-row" style="flex:1; min-width:120px;">
+                <label class="field-label" for="td-due">Due date</label>
+                <input type="date" id="td-due" class="text-input">
+            </div>
+            <div class="form-row" style="flex:1; min-width:120px;">
+                <label class="field-label" for="td-reminder">Reminder</label>
+                <input type="date" id="td-reminder" class="text-input">
+            </div>
+        </div>
+        <div style="display:flex; gap:1rem; flex-wrap:wrap;">
+            <div class="form-row" style="flex:1; min-width:120px;">
+                <label class="field-label" for="td-priority">Priority</label>
+                <select id="td-priority" class="select-input">
+                    <option value="HIGH">High</option>
+                    <option value="MEDIUM">Medium</option>
+                    <option value="LOW">Low</option>
+                </select>
+            </div>
+            <div class="form-row" style="flex:1; min-width:120px;">
+                <label class="field-label" for="td-status">Status</label>
+                <select id="td-status" class="select-input">
+                    <option value="todo">To do</option>
+                    <option value="in_progress">In progress</option>
+                    <option value="blocked">Blocked</option>
+                    <option value="done">Done</option>
+                </select>
+            </div>
+            <div class="form-row" style="flex:1; min-width:120px;">
+                <label class="field-label" for="td-tag">Tag</label>
+                <input type="text" id="td-tag" class="text-input" maxlength="50">
+            </div>
+        </div>
+        <div class="form-row">
+            <label class="field-label" for="td-institution">Institution</label>
+            <input type="text" id="td-institution" class="text-input" maxlength="200">
+        </div>
+        <div class="form-row">
+            <label class="field-label" for="td-notes">Notes</label>
+            <input type="text" id="td-notes" class="text-input" maxlength="200">
+        </div>
+
+        <div class="form-actions" style="margin-bottom:1.25rem;">
+            <button id="btn-save-task-detail" class="btn-primary" onclick="saveTaskDetail()">Save</button>
+            <button class="btn-secondary" onclick="duplicateCurrentTaskDetail()"><i class="fa-solid fa-copy"></i> Duplicate</button>
+            <button class="btn-secondary" onclick="deleteCurrentTaskDetail()"><i class="fa-solid fa-trash"></i> Delete</button>
+        </div>
+
+        <div id="task-detail-source-meeting" style="display:none;margin-bottom:1.25rem;font-size:0.85rem;"></div>
+
+        <div style="margin-bottom:1.25rem;">
+            <h3 style="color:var(--accent);font-size:0.95rem;margin-bottom:0.5rem;"><i class="fa-solid fa-paperclip"></i> Attachments</h3>
+            <div id="task-detail-attachments" style="display:flex;flex-direction:column;gap:0.4rem;margin-bottom:0.6rem;"></div>
+            <input type="file" id="td-attachment-input" style="display:none;"
+                   accept=".pdf,.pptx,.docx,.txt,.png,.jpg,.jpeg,.xlsx" onchange="uploadTaskAttachment()">
+            <button class="btn-secondary" style="padding:5px 12px;font-size:0.8rem;"
+                    onclick="document.getElementById('td-attachment-input').click()">
+                <i class="fa-solid fa-plus"></i> Add attachment
+            </button>
+        </div>
+
+        <div>
+            <h3 style="color:var(--accent);font-size:0.95rem;margin-bottom:0.5rem;"><i class="fa-solid fa-comments"></i> Comments</h3>
+            <div id="task-detail-comments" style="display:flex;flex-direction:column;gap:0.6rem;margin-bottom:0.6rem;"></div>
+            <div style="display:flex;gap:0.5rem;">
+                <input type="text" id="td-new-comment" class="text-input" placeholder="Add a comment…" style="flex:1;"
+                       onkeydown="if(event.key==='Enter'){addTaskComment();}">
+                <button class="btn-secondary" style="padding:5px 12px;" onclick="addTaskComment()">
+                    <i class="fa-solid fa-paper-plane"></i>
+                </button>
             </div>
         </div>
     </div>

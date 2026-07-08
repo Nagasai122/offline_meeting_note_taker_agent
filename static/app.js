@@ -1565,11 +1565,16 @@ function toggleAddTaskForm(show) {
     const shouldShow = show === undefined ? form.classList.contains('hidden') : show;
     form.classList.toggle('hidden', !shouldShow);
     if (shouldShow) {
+        document.getElementById('new-task-title').value = '';
         document.getElementById('new-task-description').value = '';
+        document.getElementById('new-task-owner').value = '';
+        document.getElementById('new-task-project').value = '';
         document.getElementById('new-task-due').value = '';
+        document.getElementById('new-task-reminder').value = '';
         document.getElementById('new-task-tag').value = '';
         document.getElementById('new-task-note').value = '';
         document.getElementById('new-task-priority').value = 'MEDIUM';
+        document.getElementById('new-task-status').value = 'todo';
         document.getElementById('add-task-error').textContent = '';
         _validateAddTaskForm();
         document.getElementById('new-task-description').focus();
@@ -1588,8 +1593,13 @@ async function saveManualTask() {
 
     const payload = {
         description,
+        title: document.getElementById('new-task-title').value.trim() || null,
+        owner: document.getElementById('new-task-owner').value.trim() || null,
+        project_id: document.getElementById('new-task-project').value.trim() || null,
         due_date: document.getElementById('new-task-due').value || null,
+        reminder_date: document.getElementById('new-task-reminder').value || null,
         priority: document.getElementById('new-task-priority').value,
+        status: document.getElementById('new-task-status').value,
         tag: document.getElementById('new-task-tag').value.trim() || null,
         progress_note: document.getElementById('new-task-note').value.trim() || null,
     };
@@ -1630,6 +1640,54 @@ function _filterTasks(tasks) {
     return tasks;
 }
 
+function _taskCardHtml(t) {
+    const status = t.status || 'todo';
+    const isDone = status === 'done';
+    const isBlocked = status === 'blocked';
+    return `
+    <div class="task-card" style="${isBlocked ? 'opacity:0.6;' : ''}" id="task-row-${escHtml(t.id)}">
+        <div class="task-checkbox ${isDone ? 'checked' : ''}" onclick="event.stopPropagation(); completeTask('${escHtml(t.id)}', this.closest('.task-card'))">
+            <i class="fa-solid fa-check"></i>
+        </div>
+        <div class="task-content ${isDone ? 'completed' : ''}" style="flex:1;cursor:pointer;" onclick="openTaskDetail('${escHtml(t.id)}')" title="Click to view/edit full details">
+            <h4>${escHtml(t.title || t.description)}</h4>
+            ${t.title ? `<div style="font-size:0.82rem;color:var(--text-muted);margin-top:-0.2rem;margin-bottom:0.3rem;">${escHtml(t.description)}</div>` : ''}
+            <div class="task-meta">
+                <span><i class="fa-solid fa-user"></i> ${escHtml(t.owner) || 'Unassigned'}</span>
+                <span><i class="fa-solid fa-calendar"></i> ${escHtml(t.due_date) || 'No date'}</span>
+                ${t.tag ? `<span><i class="fa-solid fa-tag"></i> ${escHtml(t.tag)}</span>` : ''}
+                ${t.session_id ? `<a class="session-link" title="Open the meeting this task came from"
+                        onclick="event.stopPropagation(); openMeetingDetail('${escHtml(t.session_id)}')">
+                        <i class="fa-solid fa-link"></i> ${escHtml(t.session_id)}</a>` : ''}
+                <button class="btn-icon" style="width:22px;height:22px;" title="Edit progress note"
+                        onclick="event.stopPropagation(); _toggleNoteEditor('${escHtml(t.id)}')">
+                    <i class="fa-solid fa-pencil" style="font-size:0.7rem;"></i>
+                </button>
+            </div>
+            <div id="note-editor-${escHtml(t.id)}" class="hidden" style="margin-top:0.5rem;">
+                <input type="text" class="text-input" value="${escHtml(t.progress_note || '')}"
+                       placeholder="Progress note…" onclick="event.stopPropagation();"
+                       onkeydown="if(event.key==='Enter'){this.blur();}"
+                       onblur="_saveProgressNote('${escHtml(t.id)}', this.value)">
+            </div>
+            ${t.progress_note ? `<div style="font-size:0.8rem;color:var(--text-muted);margin-top:0.3rem;"><i class="fa-solid fa-note-sticky"></i> ${escHtml(t.progress_note)}</div>` : ''}
+            ${t.evidence ? `<div class="evidence-quote">“${escHtml(t.evidence)}”</div>` : ''}
+        </div>
+        <select class="status-select" onclick="event.stopPropagation();" onchange="event.stopPropagation(); _updateTaskStatus('${escHtml(t.id)}', this.value)">
+            <option value="todo" ${status === 'todo' ? 'selected' : ''}>To Do</option>
+            <option value="in_progress" ${status === 'in_progress' ? 'selected' : ''}>In Progress</option>
+            <option value="done" ${status === 'done' ? 'selected' : ''}>Done</option>
+            <option value="blocked" ${status === 'blocked' ? 'selected' : ''}>Blocked</option>
+        </select>
+    </div>`;
+}
+
+// Priority grouping (roadmap item 5): High/Medium/Low sections, with a final
+// "No Priority" bucket for items that have never had one set (extraction
+// always assigns HIGH/MEDIUM/LOW, but older/manual items may predate that).
+const _PRIORITY_ORDER = ['HIGH', 'MEDIUM', 'LOW', null];
+const _PRIORITY_LABELS = { HIGH: 'High Priority', MEDIUM: 'Medium Priority', LOW: 'Low Priority', null: 'No Priority' };
+
 function renderFullTaskList(allTasks) {
     _lastTasksData = allTasks;
     const fullTaskList = document.getElementById('full-task-list');
@@ -1637,52 +1695,33 @@ function renderFullTaskList(allTasks) {
     if (!fullTaskList) return;
 
     const visible = _filterTasks(allTasks);
+    if (!allTasks.length) {
+        fullTaskList.innerHTML = '<div class="empty-state">No tasks yet. Click "Add Task" to create one.</div>';
+        if (fullTaskCount) fullTaskCount.innerText = '0';
+        return;
+    }
     if (!visible.length) {
         fullTaskList.innerHTML = '<div class="empty-state">No tasks match this filter.</div>';
         if (fullTaskCount) fullTaskCount.innerText = allTasks.length;
         return;
     }
 
-    fullTaskList.innerHTML = visible.map(t => {
-        const status = t.status || 'todo';
-        const isDone = status === 'done';
-        const isBlocked = status === 'blocked';
-        return `
-        <div class="task-card" style="${isBlocked ? 'opacity:0.6;' : ''}" id="task-row-${escHtml(t.id)}">
-            <div class="task-checkbox ${isDone ? 'checked' : ''}" onclick="event.stopPropagation(); completeTask('${escHtml(t.id)}', this.closest('.task-card'))">
-                <i class="fa-solid fa-check"></i>
+    const groups = new Map(_PRIORITY_ORDER.map(p => [p, []]));
+    visible.forEach(t => {
+        const key = _PRIORITY_ORDER.includes(t.priority) ? t.priority : null;
+        groups.get(key).push(t);
+    });
+
+    fullTaskList.innerHTML = _PRIORITY_ORDER
+        .filter(p => groups.get(p).length > 0)
+        .map(p => `
+            <div class="task-priority-group">
+                <h4 class="task-priority-group-heading priority-${(p || 'none').toLowerCase()}">${_PRIORITY_LABELS[p]}
+                    <span class="badge">${groups.get(p).length}</span>
+                </h4>
+                ${groups.get(p).map(_taskCardHtml).join('')}
             </div>
-            <div class="task-content ${isDone ? 'completed' : ''}" style="flex:1;">
-                <h4>${escHtml(t.description)}</h4>
-                <div class="task-meta">
-                    <span><i class="fa-solid fa-user"></i> ${escHtml(t.owner) || 'Unassigned'}</span>
-                    <span><i class="fa-solid fa-calendar"></i> ${escHtml(t.due_date) || 'No date'}</span>
-                    ${t.tag ? `<span><i class="fa-solid fa-tag"></i> ${escHtml(t.tag)}</span>` : ''}
-                    ${t.session_id ? `<a class="session-link" title="Open the meeting this task came from"
-                            onclick="event.stopPropagation(); openMeetingDetail('${escHtml(t.session_id)}')">
-                            <i class="fa-solid fa-link"></i> ${escHtml(t.session_id)}</a>` : ''}
-                    <button class="btn-icon" style="width:22px;height:22px;" title="Edit progress note"
-                            onclick="event.stopPropagation(); _toggleNoteEditor('${escHtml(t.id)}')">
-                        <i class="fa-solid fa-pencil" style="font-size:0.7rem;"></i>
-                    </button>
-                </div>
-                <div id="note-editor-${escHtml(t.id)}" class="hidden" style="margin-top:0.5rem;">
-                    <input type="text" class="text-input" value="${escHtml(t.progress_note || '')}"
-                           placeholder="Progress note…" onclick="event.stopPropagation();"
-                           onkeydown="if(event.key==='Enter'){this.blur();}"
-                           onblur="_saveProgressNote('${escHtml(t.id)}', this.value)">
-                </div>
-                ${t.progress_note ? `<div style="font-size:0.8rem;color:var(--text-muted);margin-top:0.3rem;"><i class="fa-solid fa-note-sticky"></i> ${escHtml(t.progress_note)}</div>` : ''}
-                ${t.evidence ? `<div class="evidence-quote">“${escHtml(t.evidence)}”</div>` : ''}
-            </div>
-            <select class="status-select" onclick="event.stopPropagation();" onchange="event.stopPropagation(); _updateTaskStatus('${escHtml(t.id)}', this.value)">
-                <option value="todo" ${status === 'todo' ? 'selected' : ''}>To Do</option>
-                <option value="in_progress" ${status === 'in_progress' ? 'selected' : ''}>In Progress</option>
-                <option value="done" ${status === 'done' ? 'selected' : ''}>Done</option>
-                <option value="blocked" ${status === 'blocked' ? 'selected' : ''}>Blocked</option>
-            </select>
-        </div>`;
-    }).join('');
+        `).join('');
     if (fullTaskCount) fullTaskCount.innerText = allTasks.length;
 }
 
@@ -1717,6 +1756,187 @@ async function _updateTaskStatus(taskId, status) {
         fetchBriefing();
     } catch (e) {
         showFetchError('Could not update task status: ' + e.message);
+    }
+}
+
+// ── Task detail side panel (P1.5) ───────────────────────────────────────────
+
+let _taskDetailId = null;
+
+async function openTaskDetail(taskId) {
+    _taskDetailId = taskId;
+    document.getElementById('task-detail-error').textContent = '';
+    try {
+        const resp = await fetch('/api/tasks/' + encodeURIComponent(taskId));
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const t = await resp.json();
+
+        document.getElementById('task-detail-title').textContent = t.title || t.description;
+        document.getElementById('td-title').value = t.title || '';
+        document.getElementById('td-description').value = t.description || '';
+        document.getElementById('td-owner').value = t.owner || '';
+        document.getElementById('td-project').value = t.project_id || '';
+        document.getElementById('td-due').value = t.due_date || '';
+        document.getElementById('td-reminder').value = t.reminder_date || '';
+        document.getElementById('td-priority').value = t.priority || 'MEDIUM';
+        document.getElementById('td-status').value = t.status || 'todo';
+        document.getElementById('td-tag').value = t.tag || '';
+        document.getElementById('td-institution').value = t.institution || '';
+        document.getElementById('td-notes').value = t.progress_note || '';
+
+        const sourceEl = document.getElementById('task-detail-source-meeting');
+        if (t.session_id) {
+            sourceEl.style.display = '';
+            sourceEl.innerHTML = `<a class="session-link" onclick="openMeetingDetail('${escHtml(t.session_id)}')">
+                <i class="fa-solid fa-link"></i> View source meeting (${escHtml(t.session_id)})</a>`;
+        } else {
+            sourceEl.style.display = 'none';
+        }
+
+        _renderTaskAttachments(t.attachments || []);
+        _renderTaskComments(t.comments || []);
+
+        document.getElementById('task-detail-overlay').classList.remove('hidden');
+        document.getElementById('task-detail-panel').classList.remove('hidden');
+    } catch (e) {
+        showFetchError('Could not load task: ' + e.message);
+    }
+}
+
+function closeTaskDetail() {
+    _taskDetailId = null;
+    document.getElementById('task-detail-overlay').classList.add('hidden');
+    document.getElementById('task-detail-panel').classList.add('hidden');
+}
+
+function _renderTaskAttachments(attachments) {
+    const el = document.getElementById('task-detail-attachments');
+    if (!attachments.length) {
+        el.innerHTML = '<div style="font-size:0.82rem;color:var(--text-muted);">No attachments yet.</div>';
+        return;
+    }
+    el.innerHTML = attachments.map(a => `
+        <div style="display:flex;align-items:center;gap:0.5rem;font-size:0.85rem;">
+            <i class="fa-solid fa-file"></i>
+            <a href="/${escHtml(a.path)}" target="_blank" rel="noopener">${escHtml(a.filename)}</a>
+        </div>`).join('');
+}
+
+function _renderTaskComments(comments) {
+    const el = document.getElementById('task-detail-comments');
+    if (!comments.length) {
+        el.innerHTML = '<div style="font-size:0.82rem;color:var(--text-muted);">No comments yet.</div>';
+        return;
+    }
+    el.innerHTML = comments.map(c => `
+        <div style="font-size:0.85rem;background:var(--panel-inset);border-radius:4px;padding:0.5rem 0.7rem;">
+            <div style="font-weight:600;">${escHtml(c.author || 'Anonymous')}</div>
+            <div>${escHtml(c.text)}</div>
+        </div>`).join('');
+}
+
+async function saveTaskDetail() {
+    if (!_taskDetailId) return;
+    const errorEl = document.getElementById('task-detail-error');
+    const payload = {
+        title: document.getElementById('td-title').value.trim() || null,
+        description: document.getElementById('td-description').value.trim() || null,
+        owner: document.getElementById('td-owner').value.trim() || null,
+        project_id: document.getElementById('td-project').value.trim() || null,
+        due_date: document.getElementById('td-due').value || null,
+        reminder_date: document.getElementById('td-reminder').value || null,
+        priority: document.getElementById('td-priority').value,
+        status: document.getElementById('td-status').value,
+        tag: document.getElementById('td-tag').value.trim() || null,
+        institution: document.getElementById('td-institution').value.trim() || null,
+        progress_note: document.getElementById('td-notes').value.trim() || null,
+    };
+    try {
+        const resp = await fetch('/api/tasks/' + encodeURIComponent(_taskDetailId), {
+            method: 'PATCH',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        closeTaskDetail();
+        fetchBriefing();
+    } catch (e) {
+        errorEl.textContent = e.message;
+    }
+}
+
+async function duplicateCurrentTaskDetail() {
+    if (!_taskDetailId) return;
+    try {
+        const resp = await fetch(`/api/tasks/${encodeURIComponent(_taskDetailId)}/duplicate`, { method: 'POST' });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        closeTaskDetail();
+        fetchBriefing();
+    } catch (e) {
+        document.getElementById('task-detail-error').textContent = e.message;
+    }
+}
+
+async function deleteCurrentTaskDetail() {
+    if (!_taskDetailId) return;
+    const confirmed = await showConfirmModal({
+        title: 'Delete this task?',
+        body: 'This soft-deletes the task -- it stays in the record for history/audit, but disappears from your task list.',
+        confirmLabel: 'Delete',
+        danger: true,
+    });
+    if (!confirmed) return;
+    try {
+        const resp = await fetch('/api/tasks/' + encodeURIComponent(_taskDetailId), { method: 'DELETE' });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        closeTaskDetail();
+        fetchBriefing();
+    } catch (e) {
+        document.getElementById('task-detail-error').textContent = 'Could not delete task: ' + e.message;
+    }
+}
+
+async function uploadTaskAttachment() {
+    if (!_taskDetailId) return;
+    const input = document.getElementById('td-attachment-input');
+    const file = input.files[0];
+    if (!file) return;
+    const formData = new FormData();
+    formData.append('file', file);
+    try {
+        const resp = await fetch(`/api/tasks/${encodeURIComponent(_taskDetailId)}/attachments`, {
+            method: 'POST',
+            body: formData,
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        _renderTaskAttachments(data.attachments);
+    } catch (e) {
+        document.getElementById('task-detail-error').textContent = 'Could not add attachment: ' + e.message;
+    } finally {
+        input.value = '';
+    }
+}
+
+async function addTaskComment() {
+    if (!_taskDetailId) return;
+    const input = document.getElementById('td-new-comment');
+    const text = input.value.trim();
+    if (!text) return;
+    try {
+        const resp = await fetch(`/api/tasks/${encodeURIComponent(_taskDetailId)}/comments`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ text }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        _renderTaskComments(data.comments);
+        input.value = '';
+    } catch (e) {
+        document.getElementById('task-detail-error').textContent = 'Could not add comment: ' + e.message;
     }
 }
 
@@ -1819,6 +2039,44 @@ async function exportCurrentSessionToVault() {
         const data = await resp.json();
         if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
         statusEl.textContent = 'Exported to ' + data.paths[0];
+    } catch (e) {
+        statusEl.textContent = 'Export failed: ' + e.message;
+    }
+}
+
+async function exportCurrentSessionToDocx() {
+    // Unlike the vault export above (which writes into a configured folder
+    // and reports the path back as JSON), this endpoint streams the .docx
+    // file itself -- download it as a blob and trigger the browser's normal
+    // save-file flow, rather than parsing a JSON response.
+    const statusEl = document.getElementById('modal-export-status');
+    const sessionId = window._currentDetailSession;
+    if (!sessionId) return;
+    statusEl.textContent = 'Exporting…';
+    try {
+        const resp = await fetch('/api/export/docx', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ session_id: sessionId }),
+        });
+        if (!resp.ok) {
+            let message = `HTTP ${resp.status}`;
+            try {
+                const data = await resp.json();
+                message = data.error || message;
+            } catch (e) { /* non-JSON error body -- keep the HTTP status message */ }
+            throw new Error(message);
+        }
+        const blob = await resp.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${sessionId}.docx`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        statusEl.textContent = 'Downloaded ' + sessionId + '.docx';
     } catch (e) {
         statusEl.textContent = 'Export failed: ' + e.message;
     }

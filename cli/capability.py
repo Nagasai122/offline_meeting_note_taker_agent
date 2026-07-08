@@ -18,7 +18,7 @@ against two different failure modes: (b) against "the agent loop's model
 decides to call it", (a) against "a future code change wires it up without
 anyone noticing".
 
-`mint_capability_token()` is deliberately called from exactly six places in
+`mint_capability_token()` is deliberately called from exactly ten places in
 the trusted CLI surface:
   1. cli/main.py `apply` command — the original call site.
   2. cli/web.py `POST /api/review/apply` endpoint — added when the web
@@ -39,6 +39,15 @@ the trusted CLI surface:
      ungated path to the same file; reconciled to share call site 5/6's
      mechanism instead of maintaining a separate one (engineering-hardening
      pass, alongside the P0/roadmap bug fixes).
+  8. cli/web.py `POST /api/tasks/{task_id}/duplicate` endpoint — mints a
+     token to call `duplicate_task()` (P1.5, full task edit + additional ops).
+  9. cli/web.py `POST /api/tasks/{task_id}/comments` endpoint — mints a token
+     to call `add_task_comment()`, an append-only read-modify-write, not the
+     generic update_task_status() allow-list.
+  10. cli/web.py `POST /api/tasks/{task_id}/attachments` endpoint — mints a
+     token to call `add_task_attachment()`, same append-only pattern as
+     comments above; the endpoint itself saves the file to
+     data/task_attachments/<task_id>/ before recording the reference.
 Grep for `mint_capability_token()` call sites is itself a verification step
 (docs/architecture.md should list this as part of the M6 verification
 checklist); this docstring must be kept current whenever a new call site is

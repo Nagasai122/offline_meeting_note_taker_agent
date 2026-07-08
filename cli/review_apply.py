@@ -17,7 +17,7 @@ but argument wiring and calls `apply_reviewed_update` here.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from cli.capability import CapabilityToken, require_capability_token
@@ -248,7 +248,8 @@ def write_manual_task(
     Args:
         token: A genuine CapabilityToken from cli.capability.mint_capability_token().
         task_data: dict with "description" (required) and optional
-            "due_date"/"priority"/"tag"/"progress_note".
+            "title"/"owner"/"due_date"/"priority"/"tag"/"progress_note"/
+            "project_id"/"reminder_date"/"status".
         todo_path: Path to data/todo.md.
         lock_path: Concurrency lock path.
         lock_timeout: Lock acquisition timeout in seconds.
@@ -265,14 +266,23 @@ def write_manual_task(
         description=task_data["description"],
         done=False,
         id=task_id,
-        owner=None,
+        title=task_data.get("title"),
+        owner=task_data.get("owner"),
+        # A human typing a task in directly is, by definition, describing
+        # their own work -- "self" is the sensible default owner_type for
+        # every manually-created task, distinct from the "unknown" default
+        # an LLM extraction falls back to when the transcript gives no clear
+        # ownership signal (see mcp_server/tools/extraction.py).
+        owner_type="self",
         due_date=task_data.get("due_date"),
         session_id=None,
         priority=task_data.get("priority") or "MEDIUM",
-        status="todo",
+        status=task_data.get("status") or "todo",
         source="manual",
         progress_note=task_data.get("progress_note"),
         tag=task_data.get("tag"),
+        project_id=task_data.get("project_id"),
+        reminder_date=task_data.get("reminder_date"),
     )
 
     with FileLock(lock_path, timeout_seconds=lock_timeout):
@@ -291,11 +301,22 @@ def update_task_status(
     lock_path: Path | str,
     lock_timeout: float,
 ) -> TodoItem:
-    """Update a subset of fields (status/due_date/progress_note/priority) on
-    an existing todo.md item by id, or mark it deleted (soft delete -- the
-    record stays in the file with status="deleted", per architecture_v2.md
-    §Phase 7.2's DELETE endpoint spec). Same CapabilityToken gating as
-    write_manual_task/apply_reviewed_update.
+    """Update a subset of fields on an existing todo.md item by id, or mark
+    it deleted (soft delete -- the record stays in the file with
+    status="deleted", per architecture_v2.md §Phase 7.2's DELETE endpoint
+    spec). Same CapabilityToken gating as write_manual_task/
+    apply_reviewed_update.
+
+    Widened for full task editing (P1.5) beyond the original status/
+    due_date/progress_note/priority set -- title/description/owner/
+    project_id/institution/tag/reminder_date are all plain scalar
+    overwrites, same shape as the original four. `owner_type` is
+    intentionally included here too (the allow-list itself doesn't need to
+    change again once P2 lands its ownership vocabulary) even though the
+    edit UI doesn't expose it yet. `comments`/`attachments` are deliberately
+    NOT in this allow-list -- those are append-only lists, not scalar
+    overwrites, and are handled by add_task_comment/add_task_attachment
+    below instead, each under their own locked read-modify-write.
 
     Raises:
         KeyError: if no item with `task_id` exists.
@@ -309,13 +330,128 @@ def update_task_status(
         if target is None:
             raise KeyError(f"No task with id '{task_id}' found in {todo_path}.")
 
-        for field in ("status", "due_date", "progress_note", "priority"):
+        for field in (
+            "title", "description", "owner", "owner_type", "due_date", "priority",
+            "status", "project_id", "institution", "tag", "progress_note", "reminder_date",
+        ):
             if field in updates and updates[field] is not None:
                 setattr(target, field, updates[field])
         if updates.get("status") == "done":
             target.done = True
         elif "status" in updates and updates["status"] is not None:
             target.done = False
+
+        atomic_write_text(todo_path, format_todo_file(existing))
+        return target
+
+
+def duplicate_task(
+    token: CapabilityToken,
+    task_id: str,
+    todo_path: Path | str,
+    lock_path: Path | str,
+    lock_timeout: float,
+) -> TodoItem:
+    """Clone an existing todo.md item under a fresh id. `source` is set to
+    "duplicate-of-<original_id>" (not "manual" or the original session_id)
+    so the duplicate's provenance isn't lost -- it's neither a fresh manual
+    task nor an extraction from the original meeting, but a copy of one.
+    The clone starts at status="todo"/done=False regardless of the
+    original's state, since duplicating a done/blocked task to track a new
+    occurrence of the same work should not inherit that history.
+
+    Raises:
+        KeyError: if no item with `task_id` exists.
+    """
+    require_capability_token(token)
+    from uuid import uuid4
+
+    with FileLock(lock_path, timeout_seconds=lock_timeout):
+        todo_path = Path(todo_path)
+        existing = parse_todo(todo_path)
+        source_item = next((item for item in existing.items if item.id == task_id), None)
+        if source_item is None:
+            raise KeyError(f"No task with id '{task_id}' found in {todo_path}.")
+
+        clone = replace(
+            source_item,
+            id=uuid4().hex[:8],
+            done=False,
+            status="todo",
+            source=f"duplicate-of-{task_id}",
+        )
+        merged = TodoFile(items=existing.items + [clone])
+        atomic_write_text(todo_path, format_todo_file(merged))
+        return clone
+
+
+def add_task_comment(
+    token: CapabilityToken,
+    task_id: str,
+    author: str | None,
+    text: str,
+    todo_path: Path | str,
+    lock_path: Path | str,
+    lock_timeout: float,
+) -> TodoItem:
+    """Append a comment to an existing task's `comments` list.
+
+    Append-only read-modify-write, not a scalar overwrite -- kept separate
+    from update_task_status's generic allow-list loop (which would replace
+    the whole list rather than append to it) for the same reason
+    add_task_attachment below is.
+
+    Raises:
+        KeyError: if no item with `task_id` exists.
+    """
+    require_capability_token(token)
+    from datetime import datetime
+
+    with FileLock(lock_path, timeout_seconds=lock_timeout):
+        todo_path = Path(todo_path)
+        existing = parse_todo(todo_path)
+        target = next((item for item in existing.items if item.id == task_id), None)
+        if target is None:
+            raise KeyError(f"No task with id '{task_id}' found in {todo_path}.")
+
+        comment = {"author": author, "text": text, "at": datetime.now().isoformat()}
+        target.comments = (target.comments or []) + [comment]
+
+        atomic_write_text(todo_path, format_todo_file(existing))
+        return target
+
+
+def add_task_attachment(
+    token: CapabilityToken,
+    task_id: str,
+    filename: str,
+    relative_path: str,
+    todo_path: Path | str,
+    lock_path: Path | str,
+    lock_timeout: float,
+) -> TodoItem:
+    """Append an attachment reference to an existing task's `attachments`
+    list. The caller (cli/web.py's POST /api/tasks/{id}/attachments) is
+    responsible for actually saving the file to disk (under
+    data/task_attachments/<task_id>/) before calling this -- this function
+    only records the reference in todo.md, under the same lock every other
+    todo.md write uses.
+
+    Raises:
+        KeyError: if no item with `task_id` exists.
+    """
+    require_capability_token(token)
+    from datetime import datetime
+
+    with FileLock(lock_path, timeout_seconds=lock_timeout):
+        todo_path = Path(todo_path)
+        existing = parse_todo(todo_path)
+        target = next((item for item in existing.items if item.id == task_id), None)
+        if target is None:
+            raise KeyError(f"No task with id '{task_id}' found in {todo_path}.")
+
+        attachment = {"filename": filename, "path": relative_path, "added_at": datetime.now().isoformat()}
+        target.attachments = (target.attachments or []) + [attachment]
 
         atomic_write_text(todo_path, format_todo_file(existing))
         return target

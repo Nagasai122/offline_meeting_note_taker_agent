@@ -7,7 +7,7 @@ import logging
 import wave
 from pathlib import Path
 from fastapi import FastAPI, Request, Form, File, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from datetime import datetime
@@ -761,7 +761,7 @@ async def upload_transcript(
     write for an auto-matched live recording. If the id doesn't resolve to a
     real event, this logs a warning and proceeds without a calendar link --
     it never fails the import over optional enrichment."""
-    from mcp_server.meeting_type import MeetingType, type_file_path
+    from mcp_server.meeting_type import MeetingType, write_meeting_type
     from mcp_server.schemas import validate_session_id, SchemaValidationError
     from mcp_server import state as state_mod
 
@@ -1481,6 +1481,40 @@ async def post_vault_export(req: VaultExportRequest):
         return JSONResponse({"error": str(exc)}, status_code=400)
 
 
+class DocxExportRequest(BaseModel):
+    session_id: str
+
+
+@app.post("/api/export/docx")
+async def post_docx_export(req: DocxExportRequest):
+    """Standalone Word export (roadmap item 3) -- independent of
+    [export].vault_dir, unlike /api/export/vault above. Renders to a
+    tmp file and streams it back as a download rather than writing into
+    data/, since a docx is a one-off artefact the user takes with them, not
+    something meant to accumulate in a synced location."""
+    from cli.docx_export import ExportError, export_session_docx
+
+    meetings_dir = Path(settings.paths.data_dir) / "meetings"
+    todo_path = Path(settings.paths.data_dir) / "todo.md"
+    state_dir = Path(settings.paths.data_dir) / "state"
+    tmp_dir = Path(settings.paths.tmp_dir)
+    output_path = tmp_dir / f"{req.session_id}.docx"
+    try:
+        # python-docx's Document.save() is blocking file I/O -- offloaded the
+        # same way every other blocking call in this file is.
+        path = await asyncio.to_thread(
+            export_session_docx, req.session_id, meetings_dir, todo_path, state_dir, output_path
+        )
+    except ExportError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    return FileResponse(
+        path,
+        filename=f"{req.session_id}.docx",
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+
 class ReviewApplyRequest(BaseModel):
     session_id: str
 
@@ -1951,10 +1985,15 @@ async def patch_settings(req: SettingsPatchRequest):
 
 class ManualTaskRequest(BaseModel):
     description: str
+    title: str | None = None
+    owner: str | None = None
     due_date: str | None = None
     priority: str = "MEDIUM"
+    status: str | None = None
     tag: str | None = None
     progress_note: str | None = None
+    project_id: str | None = None
+    reminder_date: str | None = None
 
 
 @app.post("/api/tasks/manual")
@@ -1965,32 +2004,85 @@ async def create_manual_task(req: ManualTaskRequest):
     description = req.description.strip()
     if not description or len(description) > 500:
         return JSONResponse({"error": "description must be non-empty and at most 500 characters."}, status_code=422)
+    if req.title and len(req.title) > 200:
+        return JSONResponse({"error": "title must be at most 200 characters."}, status_code=422)
+    if req.owner and len(req.owner) > 200:
+        return JSONResponse({"error": "owner must be at most 200 characters."}, status_code=422)
     if req.priority not in {"HIGH", "MEDIUM", "LOW"}:
         return JSONResponse({"error": "priority must be one of HIGH/MEDIUM/LOW."}, status_code=422)
+    if req.status is not None and req.status not in _VALID_TASK_STATUSES:
+        return JSONResponse({"error": f"status must be one of {sorted(_VALID_TASK_STATUSES)}."}, status_code=422)
     if req.tag and len(req.tag) > 50:
         return JSONResponse({"error": "tag must be at most 50 characters."}, status_code=422)
     if req.progress_note and len(req.progress_note) > 200:
         return JSONResponse({"error": "progress_note must be at most 200 characters."}, status_code=422)
+    if req.project_id and len(req.project_id) > 100:
+        return JSONResponse({"error": "project_id must be at most 100 characters."}, status_code=422)
 
     todo_path = Path(settings.paths.data_dir) / "todo.md"
     token = mint_capability_token()
     task_id = write_manual_task(
         token,
-        {"description": description, "due_date": req.due_date, "priority": req.priority,
-         "tag": req.tag, "progress_note": req.progress_note},
+        {
+            "description": description, "title": req.title, "owner": req.owner,
+            "due_date": req.due_date, "priority": req.priority, "status": req.status,
+            "tag": req.tag, "progress_note": req.progress_note,
+            "project_id": req.project_id, "reminder_date": req.reminder_date,
+        },
         todo_path, settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
     )
     return JSONResponse({"task_id": task_id, "status": "created"})
 
 
 class TaskPatchRequest(BaseModel):
-    status: str | None = None
+    title: str | None = None
+    description: str | None = None
+    owner: str | None = None
     due_date: str | None = None
-    progress_note: str | None = None
     priority: str | None = None
+    status: str | None = None
+    project_id: str | None = None
+    institution: str | None = None
+    tag: str | None = None
+    progress_note: str | None = None
+    reminder_date: str | None = None
+    # owner_type deliberately not exposed here yet -- P2 hasn't landed the
+    # owner_type vocabulary/validation, so there's nothing meaningful for a
+    # human to pick in the edit UI yet. update_task_status's allow-list
+    # already covers it so this field can be added here later without
+    # touching that function again.
 
 
 _VALID_TASK_STATUSES = {"todo", "in_progress", "done", "blocked"}
+
+
+def _task_to_detail_dict(item) -> dict:
+    """Full field set for GET /api/tasks/{id} and the side-panel edit UI --
+    a superset of _item_to_dict (cli/review_apply.py), which only serves the
+    narrower conflict-reporting use case in apply_reviewed_update."""
+    return {
+        "id": item.id, "title": item.title, "description": item.description,
+        "done": item.done, "owner": item.owner, "owner_type": item.owner_type,
+        "confidence": item.confidence, "due_date": item.due_date,
+        "reminder_date": item.reminder_date, "session_id": item.session_id,
+        "priority": item.priority, "status": item.status, "source": item.source,
+        "project_id": item.project_id, "institution": item.institution,
+        "tag": item.tag, "progress_note": item.progress_note, "evidence": item.evidence,
+        "comments": item.comments or [], "attachments": item.attachments or [],
+    }
+
+
+@app.get("/api/tasks/{task_id}")
+async def get_task(task_id: str):
+    """Read-only lookup for the task detail side panel -- no capability
+    token needed (read, not write)."""
+    from mcp_server.todo import parse_todo
+
+    todo_path = Path(settings.paths.data_dir) / "todo.md"
+    item = next((i for i in parse_todo(todo_path).items if i.id == task_id), None)
+    if item is None:
+        return JSONResponse({"error": f"No task with id '{task_id}'."}, status_code=404)
+    return JSONResponse(_task_to_detail_dict(item))
 
 
 @app.patch("/api/tasks/{task_id}")
@@ -2000,11 +2092,25 @@ async def patch_task(task_id: str, req: TaskPatchRequest):
 
     if req.status is not None and req.status not in _VALID_TASK_STATUSES:
         return JSONResponse({"error": f"status must be one of {sorted(_VALID_TASK_STATUSES)}"}, status_code=422)
+    if req.title and len(req.title) > 200:
+        return JSONResponse({"error": "title must be at most 200 characters."}, status_code=422)
+    if req.description and len(req.description) > 500:
+        return JSONResponse({"error": "description must be at most 500 characters."}, status_code=422)
+    if req.owner and len(req.owner) > 200:
+        return JSONResponse({"error": "owner must be at most 200 characters."}, status_code=422)
+    if req.project_id and len(req.project_id) > 100:
+        return JSONResponse({"error": "project_id must be at most 100 characters."}, status_code=422)
+    if req.tag and len(req.tag) > 50:
+        return JSONResponse({"error": "tag must be at most 50 characters."}, status_code=422)
+    if req.progress_note and len(req.progress_note) > 200:
+        return JSONResponse({"error": "progress_note must be at most 200 characters."}, status_code=422)
 
     todo_path = Path(settings.paths.data_dir) / "todo.md"
     updates = {
-        "status": req.status, "due_date": req.due_date,
-        "progress_note": req.progress_note, "priority": req.priority,
+        "title": req.title, "description": req.description, "owner": req.owner,
+        "due_date": req.due_date, "priority": req.priority, "status": req.status,
+        "project_id": req.project_id, "institution": req.institution, "tag": req.tag,
+        "progress_note": req.progress_note, "reminder_date": req.reminder_date,
     }
     token = mint_capability_token()
     try:
@@ -2036,6 +2142,94 @@ async def delete_task(task_id: str):
     except KeyError as exc:
         return JSONResponse({"error": str(exc)}, status_code=404)
     return JSONResponse({"task_id": task_id, "status": "deleted"})
+
+
+@app.post("/api/tasks/{task_id}/duplicate")
+async def duplicate_task_endpoint(task_id: str):
+    from cli.capability import mint_capability_token
+    from cli.review_apply import duplicate_task
+
+    todo_path = Path(settings.paths.data_dir) / "todo.md"
+    token = mint_capability_token()
+    try:
+        clone = duplicate_task(
+            token, task_id, todo_path,
+            settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
+        )
+    except KeyError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    return JSONResponse({"task_id": clone.id, "status": "created", "duplicate_of": task_id})
+
+
+class TaskCommentRequest(BaseModel):
+    text: str
+    author: str | None = None
+
+
+@app.post("/api/tasks/{task_id}/comments")
+async def add_task_comment_endpoint(task_id: str, req: TaskCommentRequest):
+    from cli.capability import mint_capability_token
+    from cli.review_apply import add_task_comment
+
+    text = req.text.strip()
+    if not text or len(text) > 1000:
+        return JSONResponse({"error": "text must be non-empty and at most 1000 characters."}, status_code=422)
+
+    todo_path = Path(settings.paths.data_dir) / "todo.md"
+    token = mint_capability_token()
+    try:
+        item = add_task_comment(
+            token, task_id, req.author, text, todo_path,
+            settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
+        )
+    except KeyError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    return JSONResponse({"task_id": task_id, "comments": item.comments})
+
+
+_TASK_ATTACHMENT_SUFFIXES = {".pdf", ".pptx", ".docx", ".txt", ".png", ".jpg", ".jpeg", ".xlsx"}
+
+
+@app.post("/api/tasks/{task_id}/attachments")
+async def add_task_attachment_endpoint(task_id: str, file: UploadFile = File(...)):
+    """Same size cap and extension allowlist as /api/context/upload -- task
+    attachments are a separate concept and separate storage location
+    (data/task_attachments/<task_id>/) from meeting-context attachments
+    (data/meetings/), even when a task originated from a meeting: a task's
+    attachments are about that task, not a copy of everything the source
+    meeting saw."""
+    from cli.capability import mint_capability_token
+    from cli.review_apply import add_task_attachment
+
+    filename = Path(file.filename or "upload").name
+    suffix = Path(filename).suffix.lower()
+    if suffix not in _TASK_ATTACHMENT_SUFFIXES:
+        return JSONResponse(
+            {"error": f"Unsupported file type '{suffix}'. Allowed: {sorted(_TASK_ATTACHMENT_SUFFIXES)}"},
+            status_code=400,
+        )
+
+    content = await file.read()
+    if len(content) > _MAX_UPLOAD_BYTES:
+        return JSONResponse({"error": "File exceeds the 50MB limit."}, status_code=413)
+
+    attachments_dir = Path(settings.paths.data_dir) / "task_attachments" / task_id
+    attachments_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = attachments_dir / filename
+    await asyncio.to_thread(dest_path.write_bytes, content)
+
+    todo_path = Path(settings.paths.data_dir) / "todo.md"
+    token = mint_capability_token()
+    relative_path = str(Path("task_attachments") / task_id / filename)
+    try:
+        item = add_task_attachment(
+            token, task_id, filename, relative_path, todo_path,
+            settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
+        )
+    except KeyError as exc:
+        dest_path.unlink(missing_ok=True)
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    return JSONResponse({"task_id": task_id, "attachments": item.attachments})
 
 
 # ── Todo complete ──────────────────────────────────────────────────────────────

@@ -270,6 +270,33 @@ def test_apply_happy_path(client):
     assert final_state.state == State.APPLIED
 
 
+def test_docx_export_returns_a_downloadable_file(client):
+    c, dirs = client
+    items = [{"id": "ddd444", "description": "Write the summary", "owner": "Dave", "due_date": "2026-07-05"}]
+    _advance_to_reviewed(dirs, "s1", items)
+    resp_apply = c.post("/api/review/apply", json={"session_id": "s1"})
+    assert resp_apply.status_code == 200
+
+    resp = c.post("/api/export/docx", json={"session_id": "s1"})
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+    assert len(resp.content) > 0
+
+
+def test_docx_export_unreviewed_session_returns_400(client):
+    c, dirs = client
+    # EXTRACTED, not yet PROPOSED -- no human has reviewed this session's
+    # draft items yet, so it must not be exportable (PROPOSED/REVIEWED/
+    # APPLIED are; EXTRACTED and earlier are not).
+    create_session(dirs["state_dir"], "s1", dirs["lock_path"], 1.0, initial_state=State.EXTRACTED)
+
+    resp = c.post("/api/export/docx", json={"session_id": "s1"})
+    assert resp.status_code == 400
+    assert "human review" in resp.json()["error"]
+
+
 def test_apply_surfaces_conflicts(client):
     c, dirs = client
     # Plant the same id in todo.md first

@@ -8,10 +8,15 @@ import pytest
 from cli.capability import mint_capability_token
 from cli.review_apply import (
     ReviewDecision,
+    add_task_attachment,
+    add_task_comment,
     apply_reviewed_update,
     complete_review,
+    duplicate_task,
     load_pending_items,
     load_reviewed_decisions,
+    update_task_status,
+    write_manual_task,
     write_reviewed_decisions,
 )
 from mcp_server.state import InvalidTransitionError, State, create_session, load_session_state
@@ -243,3 +248,137 @@ def test_apply_missing_reviewed_file_raises(tmp_path):
             token, "s4", dirs["pending_review_dir"], dirs["todo_path"], dirs["data_dir"],
             dirs["state_dir"], dirs["lock_path"], 1.0,
         )
+
+
+def test_write_manual_task_full_field_set(tmp_path):
+    dirs = _dirs(tmp_path)
+    token = mint_capability_token()
+
+    task_id = write_manual_task(
+        token,
+        {
+            "description": "Recruit new project staff",
+            "title": "Recruit staff",
+            "owner": "Professor Atta",
+            "due_date": "2026-08-31",
+            "priority": "HIGH",
+            "status": "in_progress",
+            "tag": "Recruitment",
+            "progress_note": "Waiting for HR approval.",
+            "project_id": "cybersec-proj",
+            "reminder_date": "2026-08-25",
+        },
+        dirs["todo_path"], dirs["lock_path"], 1.0,
+    )
+
+    item = parse_todo(dirs["todo_path"]).items[0]
+    assert item.id == task_id
+    assert item.title == "Recruit staff"
+    assert item.owner == "Professor Atta"
+    # A manually-created task is, by definition, the user's own -- default
+    # owner_type is "self", distinct from extraction's "unknown" default.
+    assert item.owner_type == "self"
+    assert item.status == "in_progress"
+    assert item.project_id == "cybersec-proj"
+    assert item.reminder_date == "2026-08-25"
+    assert item.source == "manual"
+
+
+def test_write_manual_task_defaults_status_to_todo_when_omitted(tmp_path):
+    dirs = _dirs(tmp_path)
+    token = mint_capability_token()
+
+    write_manual_task(token, {"description": "Bare-minimum task"}, dirs["todo_path"], dirs["lock_path"], 1.0)
+
+    item = parse_todo(dirs["todo_path"]).items[0]
+    assert item.status == "todo"
+    assert item.title is None
+    assert item.project_id is None
+
+
+def test_update_task_status_widened_allow_list(tmp_path):
+    """P1.5: update_task_status now accepts the full edit field set, not
+    just the original status/due_date/progress_note/priority four."""
+    dirs = _dirs(tmp_path)
+    write_manual_task(mint_capability_token(), {"description": "Original"}, dirs["todo_path"], dirs["lock_path"], 1.0)
+    task_id = parse_todo(dirs["todo_path"]).items[0].id
+
+    update_task_status(
+        mint_capability_token(), task_id,
+        {
+            "title": "New title", "description": "New description", "owner": "Naga",
+            "project_id": "proj-1", "institution": "UREAD", "tag": "WP2",
+            "reminder_date": "2026-09-01",
+        },
+        dirs["todo_path"], dirs["lock_path"], 1.0,
+    )
+
+    item = parse_todo(dirs["todo_path"]).items[0]
+    assert item.title == "New title"
+    assert item.description == "New description"
+    assert item.owner == "Naga"
+    assert item.project_id == "proj-1"
+    assert item.institution == "UREAD"
+    assert item.tag == "WP2"
+    assert item.reminder_date == "2026-09-01"
+
+
+def test_duplicate_task_clones_under_fresh_id_reset_to_todo(tmp_path):
+    dirs = _dirs(tmp_path)
+    write_manual_task(
+        mint_capability_token(),
+        {"description": "Recurring task", "owner": "Naga", "priority": "HIGH", "status": "done"},
+        dirs["todo_path"], dirs["lock_path"], 1.0,
+    )
+    original = parse_todo(dirs["todo_path"]).items[0]
+    # Simulate it having been completed before duplicating.
+    update_task_status(mint_capability_token(), original.id, {"status": "done"}, dirs["todo_path"], dirs["lock_path"], 1.0)
+
+    clone = duplicate_task(mint_capability_token(), original.id, dirs["todo_path"], dirs["lock_path"], 1.0)
+
+    assert clone.id != original.id
+    assert clone.description == "Recurring task"
+    assert clone.owner == "Naga"
+    assert clone.priority == "HIGH"
+    # The clone starts fresh, not inheriting the original's completed state.
+    assert clone.status == "todo"
+    assert clone.done is False
+    assert clone.source == f"duplicate-of-{original.id}"
+
+    todo = parse_todo(dirs["todo_path"])
+    assert len(todo.items) == 2  # original preserved alongside the clone
+
+
+def test_duplicate_task_unknown_id_raises(tmp_path):
+    dirs = _dirs(tmp_path)
+    with pytest.raises(KeyError):
+        duplicate_task(mint_capability_token(), "does-not-exist", dirs["todo_path"], dirs["lock_path"], 1.0)
+
+
+def test_add_task_comment_appends_without_overwriting(tmp_path):
+    dirs = _dirs(tmp_path)
+    write_manual_task(mint_capability_token(), {"description": "Task with comments"}, dirs["todo_path"], dirs["lock_path"], 1.0)
+    task_id = parse_todo(dirs["todo_path"]).items[0].id
+
+    add_task_comment(mint_capability_token(), task_id, "Naga", "First comment", dirs["todo_path"], dirs["lock_path"], 1.0)
+    item = add_task_comment(mint_capability_token(), task_id, "Dave", "Second comment", dirs["todo_path"], dirs["lock_path"], 1.0)
+
+    assert len(item.comments) == 2
+    assert item.comments[0]["author"] == "Naga"
+    assert item.comments[0]["text"] == "First comment"
+    assert item.comments[1]["author"] == "Dave"
+    assert item.comments[1]["text"] == "Second comment"
+    assert "at" in item.comments[0]
+
+
+def test_add_task_attachment_appends_without_overwriting(tmp_path):
+    dirs = _dirs(tmp_path)
+    write_manual_task(mint_capability_token(), {"description": "Task with files"}, dirs["todo_path"], dirs["lock_path"], 1.0)
+    task_id = parse_todo(dirs["todo_path"]).items[0].id
+
+    add_task_attachment(mint_capability_token(), task_id, "a.pdf", "task_attachments/x/a.pdf", dirs["todo_path"], dirs["lock_path"], 1.0)
+    item = add_task_attachment(mint_capability_token(), task_id, "b.png", "task_attachments/x/b.png", dirs["todo_path"], dirs["lock_path"], 1.0)
+
+    assert len(item.attachments) == 2
+    assert item.attachments[0]["filename"] == "a.pdf"
+    assert item.attachments[1]["filename"] == "b.png"

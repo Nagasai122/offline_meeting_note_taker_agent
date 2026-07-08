@@ -411,6 +411,27 @@ h1, h2, h3 {
     font-weight: 650;
 }
 
+/* Task prioritization (roadmap item 5): grouped High/Medium/Low sections in
+   the Tasks tab, each with a colored heading matching the same danger/amber/
+   petrol accent vocabulary used elsewhere for priority/quality signals. */
+.task-priority-group {
+    margin-bottom: 1.5rem;
+}
+.task-priority-group-heading {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    font-size: 0.95rem;
+    font-weight: 650;
+    margin: 0 0 0.6rem;
+    padding-bottom: 0.4rem;
+    border-bottom: 1px solid var(--line);
+}
+.task-priority-group-heading.priority-high { color: var(--signal-deep); }
+.task-priority-group-heading.priority-medium { color: var(--amber); }
+.task-priority-group-heading.priority-low { color: var(--petrol); }
+.task-priority-group-heading.priority-none { color: var(--mist); }
+
 /* Counts are machine facts → mono. */
 .badge {
     background: var(--panel-inset);

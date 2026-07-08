@@ -72,3 +72,60 @@ def test_format_item_roundtrips_through_parse(tmp_path):
     path.write_text(format_item(item) + "\n")
     parsed = parse_todo(path).items[0]
     assert parsed == item
+
+
+def test_legacy_item_parses_with_all_new_fields_none(tmp_path):
+    # An item whose meta JSON predates title/owner_type/project_id/etc. must
+    # parse with all of them None -- never a KeyError -- exactly like the
+    # existing priority/status/source/progress_note/tag guarantee above.
+    path = tmp_path / "todo.md"
+    path.write_text('- [ ] Old-format item <!-- meta: {"id": "a1"} -->\n')
+    item = parse_todo(path).items[0]
+    assert item.title is None
+    assert item.owner_type is None
+    assert item.confidence is None
+    assert item.project_id is None
+    assert item.institution is None
+    assert item.reminder_date is None
+    assert item.comments is None
+    assert item.attachments is None
+
+
+def test_new_fields_roundtrip_through_parse(tmp_path):
+    item = TodoItem(
+        description="Recruit new project staff",
+        id="a1b2c3",
+        title="Recruit staff",
+        owner="Professor Atta",
+        owner_type="self",
+        confidence=0.92,
+        project_id="proj-42",
+        institution="UREAD",
+        reminder_date="2026-08-25",
+        comments=[{"author": "Naga", "text": "Waiting on HR", "at": "2026-07-08T10:00:00"}],
+        attachments=[{"filename": "job_spec.pdf", "path": "data/task_attachments/a1b2c3/job_spec.pdf", "added_at": "2026-07-08T10:00:00"}],
+    )
+    path = tmp_path / "todo.md"
+    path.write_text(format_item(item) + "\n")
+    parsed = parse_todo(path).items[0]
+    assert parsed == item
+
+
+def test_format_item_omits_new_fields_when_unset_keeping_old_rows_unchanged(tmp_path):
+    # Conditional-include (same pattern as `evidence`): a plain manual task
+    # that doesn't use any of the new fields must not grow
+    # '"comments": null, "attachments": null, ...' clutter on every rewrite,
+    # and an existing legacy row must come back out byte-identical.
+    original_line = '- [ ] Old-format item <!-- meta: {"id": "a1"} -->'
+    path = tmp_path / "todo.md"
+    path.write_text(original_line + "\n")
+    todo_file = parse_todo(path)
+    rewritten = format_item(todo_file.items[0])
+    assert "title" not in rewritten
+    assert "owner_type" not in rewritten
+    assert "confidence" not in rewritten
+    assert "project_id" not in rewritten
+    assert "institution" not in rewritten
+    assert "reminder_date" not in rewritten
+    assert "comments" not in rewritten
+    assert "attachments" not in rewritten
