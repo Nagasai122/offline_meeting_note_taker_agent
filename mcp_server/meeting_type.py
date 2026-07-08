@@ -73,3 +73,20 @@ def load_meeting_type(type_file_path: Path | str) -> MeetingType:
 def type_file_path(meetings_dir: Path | str, session_id: str) -> Path:
     """Canonical location of a session's `.type` file."""
     return Path(meetings_dir) / f"{session_id}.type"
+
+
+def write_meeting_type(meetings_dir: Path | str, session_id: str, meeting_type: str) -> None:
+    """Write a session's `.type` marker file atomically.
+
+    Previously three separate call sites (cli/main.py, and twice in
+    cli/web.py) each did their own plain `.write_text(...)`, duplicating the
+    same two-line write and, more importantly, none of them atomic -- a crash
+    mid-write leaves a truncated/empty `.type` file, which silently falls
+    back to slug-based detection (load_meeting_type above) rather than
+    corrupting anything critical, but there's no reason to accept even that
+    small a risk when atomic_write_text is one import away and every other
+    call site already uses it for this project's other artefact writers.
+    """
+    from concurrency.atomic import atomic_write_text
+
+    atomic_write_text(type_file_path(meetings_dir, session_id), meeting_type)

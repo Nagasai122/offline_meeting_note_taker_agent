@@ -15,6 +15,7 @@ import logging
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from concurrency.atomic import atomic_write_text
 from mcp_server.todo import TodoItem, parse_todo
 
 logger = logging.getLogger(__name__)
@@ -37,14 +38,20 @@ def load_sent_reminders(data_dir: Path | str) -> dict[str, str]:
 
 
 def save_sent_reminder(data_dir: Path | str, task_id: str, sent_at: str) -> None:
-    """Atomically update task_id's last-notified timestamp."""
+    """Atomically update task_id's last-notified timestamp.
+
+    Uses concurrency.atomic.atomic_write_text (tmp+fsync+os.replace) rather
+    than the tmp-write+rename this used to hand-roll without an fsync --
+    atomic against a torn read either way, but not against power loss between
+    the write and the rename without the fsync. A lost update here just means
+    one duplicate toast gets sent later, not data corruption, but there's no
+    reason not to use the same primitive the rest of the project already
+    does for exactly this pattern."""
     data_dir = Path(data_dir)
     path = data_dir / REMINDERS_FILE
     sent = load_sent_reminders(data_dir)
     sent[task_id] = sent_at
-    tmp_path = path.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(sent, indent=2), encoding="utf-8")
-    tmp_path.replace(path)
+    atomic_write_text(path, json.dumps(sent, indent=2))
 
 
 def _parse_due_date(value: str) -> date | None:

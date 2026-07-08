@@ -146,6 +146,34 @@ def _build_launch_command(
     return cmd
 
 
+def _available_vram_gb() -> float | None:
+    """Query free GPU VRAM via `nvidia-smi`, in GB. Returns None (not 0.0) if
+    it can't be determined -- no NVIDIA GPU, driver not installed/visible, or
+    any other query failure -- so callers can distinguish "no data, skip the
+    check" from "definitely insufficient". Same tool scripts/gpu_check.py
+    already uses for its own diagnostics; this is a narrower, single-purpose
+    reuse of the same `nvidia-smi --query-gpu` approach, not a new dependency."""
+    import shutil
+
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return None
+    try:
+        result = subprocess.run(
+            [exe, "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        # First GPU only -- this project's pre-flight budget check is about
+        # "will the configured profile fit on this machine", not multi-GPU
+        # placement, which nothing here supports launching across anyway.
+        first_line = result.stdout.strip().splitlines()[0]
+        return float(first_line.strip()) / 1024.0  # MiB -> GB
+    except Exception:
+        return None
+
+
 def start_server(
     profile: ModelProfile,
     models_dir: Path,
@@ -171,6 +199,26 @@ def start_server(
         )
 
     weights_path = resolve_weights_path(profile, models_dir)
+
+    # Bug fix: ModelProfile.is_within_budget() was written specifically "to
+    # fail fast and obviously before attempting to launch a profile that was
+    # never going to fit" (see its own docstring) but was never actually
+    # called anywhere -- a real safety check that shipped inert. Only enforced
+    # when VRAM can actually be queried (_available_vram_gb returns None on
+    # non-NVIDIA/no-driver machines, where this check cannot mean anything and
+    # must not block a valid CPU-or-other-GPU setup). This is still just the
+    # declared-budget pre-flight check the docstring describes, not a
+    # replacement for the measured-baseline work called out there.
+    available_vram_gb = _available_vram_gb()
+    if available_vram_gb is not None and not profile.is_within_budget(available_vram_gb):
+        raise ServerLaunchError(
+            f"Profile '{profile.name}' declares a {profile.declared_vram_gb:.1f}GB VRAM "
+            f"budget, but only {available_vram_gb:.1f}GB is currently free (nvidia-smi). "
+            "Close other GPU workloads, or switch to a smaller profile "
+            "(config/settings.toml's [llm].active_profile) -- see llm/model_profiles.py "
+            "for the available profiles and their declared budgets."
+        )
+
     cmd = _build_launch_command(profile, weights_path, host, port)
     env = _privacy_env(disable_telemetry_env)
 

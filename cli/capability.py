@@ -33,6 +33,12 @@ the trusted CLI surface:
      `update_task_status()`.
   6. cli/web.py `DELETE /api/tasks/{task_id}` endpoint — mints a token to call
      `update_task_status()` with a status="deleted" soft delete.
+  7. cli/web.py `POST /api/todo/complete` endpoint — mints a token to call
+     `update_task_status()` with a status="done" update. Previously wrote
+     todo.md directly (no token, no FileLock, no atomic write) as a second,
+     ungated path to the same file; reconciled to share call site 5/6's
+     mechanism instead of maintaining a separate one (engineering-hardening
+     pass, alongside the P0/roadmap bug fixes).
 Grep for `mint_capability_token()` call sites is itself a verification step
 (docs/architecture.md should list this as part of the M6 verification
 checklist); this docstring must be kept current whenever a new call site is

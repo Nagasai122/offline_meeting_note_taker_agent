@@ -73,6 +73,12 @@ IMPORT_ALLOWLIST: dict[tuple[str, str], str] = {
     ("cli/main.py", "huggingface_hub"): "lazy import inside setup() — the one permitted network command",
     ("cli/web.py", "socket"): "socket.create_connection to 127.0.0.1/settings.llm.host only (LLM port probes)",
     ("cli/app_launcher.py", "socket"): "127.0.0.1:8000 dashboard-readiness probe only (tray launcher)",
+    ("cli/web.py", "urllib"): (
+        "urllib.parse only (_origin_allowed, CSRF hardening) -- pure string "
+        "parsing of an already-received request's Origin/Referer header to "
+        "extract its hostname, no network I/O; urllib.request is never "
+        "imported anywhere in this file"
+    ),
 }
 
 

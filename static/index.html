@@ -132,9 +132,10 @@
                         <div class="widget-header">
                             <h3><i class="fa-solid fa-calendar"></i> Today's Schedule</h3>
                             <span class="badge" id="meeting-count">0</span>
-                            <button id="btn-sync-calendar" class="btn-icon" title="Sync Outlook calendar (on-demand, local COM only)" aria-label="Sync calendar" onclick="syncCalendar()">
+                            <button id="btn-sync-calendar" class="btn-icon" title="Sync Outlook calendar (on-demand, local COM only)" aria-label="Sync calendar" onclick="syncCalendar('btn-sync-calendar', 'sync-status-dashboard')">
                                 <i class="fa-solid fa-rotate"></i>
                             </button>
+                            <span id="sync-status-dashboard" style="font-size:0.75rem;color:var(--text-muted);margin-left:0.4rem;"></span>
                         </div>
                         <div class="widget-body" id="calendar-list">
                             <!-- Populated by JS -->
@@ -205,8 +206,20 @@
 
             <div id="view-calendar" class="hidden">
                 <section class="card glass-panel">
-                    <div class="card-header">
+                    <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
                         <h2><i class="fa-solid fa-calendar-days" style="color: var(--primary);"></i> Upcoming Schedule (7 Days)</h2>
+                        <div style="display:flex;align-items:center;">
+                            <!-- Bug fix: previously the only Sync button lived on the
+                                 Dashboard tab, so a user on this Calendar tab had to
+                                 switch tabs to trigger a sync, then switch back to see
+                                 it -- which read as "sync doesn't refresh the calendar
+                                 view". syncCalendar() updates both #calendar-list and
+                                 #full-calendar-list regardless of which button fired it. -->
+                            <button id="btn-sync-calendar-full" class="btn-icon" title="Sync Outlook calendar (on-demand, local COM only)" aria-label="Sync calendar" onclick="syncCalendar('btn-sync-calendar-full', 'sync-status-full')">
+                                <i class="fa-solid fa-rotate"></i>
+                            </button>
+                            <span id="sync-status-full" style="font-size:0.75rem;color:var(--text-muted);margin-left:0.4rem;"></span>
+                        </div>
                     </div>
                     <div id="full-calendar-list" style="display: flex; flex-direction: column; gap: 15px;">
                         <p style="color: var(--text-muted);">Loading calendar...</p>

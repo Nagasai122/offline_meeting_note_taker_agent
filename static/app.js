@@ -145,7 +145,20 @@ function updateUI(data) {
     }
 
     _renderDueAlertCards(data.tasks);
-    
+
+    // Nav "Needs Review" badge: previously only updated inside
+    // loadReviewQueue() (tab-switch or 800ms after submitReview()/
+    // applySession()), so a session that newly reached PROPOSED while the
+    // user was on a different tab left the badge stale until they happened
+    // to visit Review. Piggyback on this poll (already running every 5s)
+    // instead -- backend computes the count from the same pipeline_status()
+    // data loadReviewQueue's full fetch uses, so the two never disagree.
+    const reviewBadge = document.getElementById('review-badge');
+    if (reviewBadge && typeof data.review_pending_count === 'number') {
+        reviewBadge.textContent = data.review_pending_count;
+        reviewBadge.style.display = data.review_pending_count > 0 ? '' : 'none';
+    }
+
     // Update Notes
     const notesList = document.getElementById('notes-list'); // Dashboard widget
     const notesCount = document.getElementById('notes-count');
@@ -658,15 +671,31 @@ async function _saveHighlightNote(note) {
     }
 }
 
-async function syncCalendar() {
-    const btn = document.getElementById('btn-sync-calendar');
+async function syncCalendar(buttonId, statusId) {
+    // Generalized to take an explicit button/status pair so both the
+    // Dashboard tab's and the Calendar tab's Sync buttons can share one
+    // implementation (previously the Calendar tab had no Sync button at all
+    // -- see the #btn-sync-calendar-full markup in index.html). Defaults
+    // keep any other/legacy caller working unchanged.
+    const btn = document.getElementById(buttonId || 'btn-sync-calendar');
+    const statusEl = document.getElementById(statusId || 'sync-status-dashboard');
     if (btn) btn.disabled = true;
+    if (statusEl) statusEl.textContent = 'Syncing…';
     try {
         const response = await fetch('/api/calendar/sync', { method: 'POST' });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        fetchBriefing();
+        const data = await response.json();
+        // fetchBriefing() repopulates both #calendar-list (Dashboard) and
+        // #full-calendar-list (Calendar tab) regardless of which button
+        // triggered the sync, so either entry point refreshes both views.
+        await fetchBriefing();
+        if (statusEl) {
+            statusEl.textContent = `Synced ${data.count ?? 0} event${data.count === 1 ? '' : 's'}`;
+            setTimeout(() => { if (statusEl.textContent.startsWith('Synced')) statusEl.textContent = ''; }, 4000);
+        }
     } catch (e) {
         showFetchError(`Calendar sync failed: ${e.message}`);
+        if (statusEl) statusEl.textContent = 'Sync failed';
     } finally {
         if (btn) btn.disabled = false;
     }

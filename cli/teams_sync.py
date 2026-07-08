@@ -3,6 +3,8 @@ import json
 import logging
 from pathlib import Path
 
+from concurrency.atomic import atomic_write_text
+
 logger = logging.getLogger(__name__)
 
 def fetch_outlook_calendar(output_path: Path) -> int:
@@ -75,8 +77,12 @@ def fetch_outlook_calendar(output_path: Path) -> int:
         logger.error("Error iterating over Outlook items: %s", e)
         return 0
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(events, f, indent=2)
-        
+    # atomic_write_text (tmp+fsync+os.replace) rather than a plain open/write:
+    # a crash mid-write here previously risked leaving calendar.json truncated
+    # or empty, which build_daily_briefing (cli/briefing.py) reads on every
+    # dashboard poll -- self-healing on the next sync either way, but no
+    # reason to leave a truncated-JSON window open when every other sidecar
+    # writer in this project already closed it.
+    atomic_write_text(output_path, json.dumps(events, indent=2))
+
     return len(events)

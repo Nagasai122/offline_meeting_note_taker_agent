@@ -694,7 +694,7 @@ def import_transcript(
     WebVTT, SRT, and plain text.
     """
     from mcp_server import state as state_mod
-    from mcp_server.meeting_type import MeetingType, type_file_path
+    from mcp_server.meeting_type import MeetingType, write_meeting_type
     from transcribe.import_parsers import parse_transcript_file
     from transcribe.postprocess import write_transcript
     from transcribe.whisper_runner import TranscriptionResult, TranscriptSegment
@@ -725,7 +725,7 @@ def import_transcript(
         state_dir, session_id, lock_path, lock_timeout, initial_state=state_mod.State.STOPPED,
         meeting_type=meeting_type, source="import", whisper_model=model_used,
     )
-    type_file_path(meetings_dir, session_id).write_text(meeting_type, encoding="utf-8")
+    write_meeting_type(meetings_dir, session_id, meeting_type)
 
     segments = parse_transcript_file(file)
     result = TranscriptionResult(

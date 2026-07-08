@@ -14,6 +14,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
+from concurrency.atomic import atomic_write_text
 from transcribe.whisper_runner import TranscriptionResult
 
 
@@ -52,7 +53,12 @@ def write_transcript(meetings_dir: Path, result: TranscriptionResult) -> Path:
     md_path = meetings_dir / f"{result.session_id}.md"
     json_path = meetings_dir / f"{result.session_id}.json"
 
-    md_path.write_text(format_transcript_markdown(result), encoding="utf-8")
-    json_path.write_text(json.dumps(asdict(result), indent=2), encoding="utf-8")
+    # atomic_write_text rather than a plain write_text: these two files are
+    # the durable record of a whole recording's transcription -- everything
+    # downstream (extraction, review, resume-from-stall) reads them, so a
+    # crash mid-write truncating either one is exactly the kind of silent
+    # data loss this project's other artefact writers already guard against.
+    atomic_write_text(md_path, format_transcript_markdown(result))
+    atomic_write_text(json_path, json.dumps(asdict(result), indent=2))
 
     return md_path

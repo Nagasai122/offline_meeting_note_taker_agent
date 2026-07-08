@@ -4,6 +4,7 @@ import os
 import json
 import asyncio
 import logging
+import wave
 from pathlib import Path
 from fastapi import FastAPI, Request, Form, File, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -73,6 +74,61 @@ settings = load_settings(DEFAULT_SETTINGS_PATH)
 static_dir = Path(__file__).parent.parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
+
+def _origin_allowed(origin: str) -> bool:
+    if origin == "null":
+        # Browsers send the literal string "null" as Origin for some
+        # sandboxed/local contexts (e.g. a file:// page) -- not attacker-
+        # controlled in the way a real cross-origin website is, and not
+        # worth rejecting for this app's threat model.
+        return True
+    try:
+        from urllib.parse import urlparse
+        hostname = urlparse(origin).hostname
+    except Exception:
+        return False
+    return hostname in ("127.0.0.1", "localhost")
+
+
+@app.middleware("http")
+async def _csrf_origin_guard(request: Request, call_next):
+    """Reject cross-origin state-changing requests against this otherwise
+    unauthenticated localhost-only API (CSRF hardening).
+
+    Why this exists: this server binds 127.0.0.1 only and has no auth of any
+    kind -- "localhost-only" is the entire security model. Without this
+    check, any webpage the user's browser has open concurrently (a malicious
+    site, a compromised ad, a rogue browser extension) could trigger state-
+    changing requests here with zero user interaction: plain HTML <form>
+    submissions and multipart/form-data or text/plain fetch() bodies are all
+    CORS-"simple" requests that never trigger a preflight, so the browser's
+    same-origin policy alone does not protect a server that performs no
+    origin check of its own. Manual-task CRUD in particular bypasses the
+    human-review gate entirely (by design, for a different reason -- it's
+    meant to write immediately), so this was a genuine path to silently
+    creating/editing/deleting data/todo.md entries, or starting/stopping a
+    recording, from an unrelated tab.
+
+    Only applied to methods that mutate state -- GET/HEAD/OPTIONS are always
+    allowed through. A request with NO Origin/Referer header at all is
+    deliberately allowed too: modern browsers always attach an Origin header
+    to cross-origin fetch()/form requests (that's the mechanism this guard
+    actually relies on), so an absent header means either a same-origin
+    browser request that happened to omit it, or a non-browser client (curl,
+    the test suite's TestClient, a future CLI-adjacent tool) -- neither of
+    which is the attack this guards against. Rejecting only when an
+    Origin/Referer IS present and does NOT resolve to 127.0.0.1/localhost
+    keeps that legitimate traffic working while closing the actual gap.
+    """
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        origin = request.headers.get("origin") or request.headers.get("referer")
+        if origin and not _origin_allowed(origin):
+            return JSONResponse(
+                {"error": "Rejected: request did not originate from this app's own dashboard."},
+                status_code=403,
+            )
+    return await call_next(request)
+
 # Keep track of active recording processes.
 # NOTE: these are plain module-level globals with no cross-process sharing.
 # Do not run this app with uvicorn --workers > 1 (or any multi-process
@@ -106,6 +162,52 @@ def _probe_loopback_available() -> bool:
         return False
 
 
+_LIVE_TRANSCRIPTION_WINDOW_SECONDS = 30.0
+
+
+def _extract_recent_audio_window(wav_path: Path, window_seconds: float, out_path: Path) -> bool:
+    """Write the last `window_seconds` of `wav_path` to `out_path` as a
+    smaller, same-format WAV file. Returns False (leaving out_path untouched)
+    if wav_path can't be read as a WAV right now -- e.g. it's mid-write by
+    the recorder; a torn read here just skips one poll cycle, not fatal.
+
+    Bug fix (O(n^2) hot path): live_transcription_worker used to call
+    model.transcribe() on the ENTIRE growing recording every poll cycle, so
+    total transcription work across a meeting grew quadratically with
+    elapsed time. This app explicitly supports long ("Seminar") sessions --
+    for a multi-hour recording, each cycle's transcription time eventually
+    exceeded the 3s poll interval, pinning a CPU core and making the live
+    preview fall further and further behind real time. Bounding the input to
+    only the most recent audio makes each cycle's cost constant regardless of
+    total meeting length; re-encoding to a small sibling WAV (rather than
+    passing raw frames directly) keeps using faster-whisper's normal
+    file-based decode path unchanged, which already resamples/handles both
+    the mic (16kHz mono) and loopback (48kHz stereo) source formats
+    correctly -- avoids re-deriving that logic here."""
+    try:
+        with wave.open(str(wav_path), "rb") as src:
+            n_channels = src.getnchannels()
+            sampwidth = src.getsampwidth()
+            framerate = src.getframerate()
+            total_frames = src.getnframes()
+            window_frames = int(window_seconds * framerate)
+            start_frame = max(0, total_frames - window_frames)
+            src.setpos(start_frame)
+            frames = src.readframes(total_frames - start_frame)
+    except (wave.Error, OSError, EOFError):
+        return False
+
+    if not frames:
+        return False
+
+    with wave.open(str(out_path), "wb") as dst:
+        dst.setnchannels(n_channels)
+        dst.setsampwidth(sampwidth)
+        dst.setframerate(framerate)
+        dst.writeframes(frames)
+    return True
+
+
 def live_transcription_worker(session_id):
     global live_transcript
     # Signal the UI immediately so the SSE panel shows something other than the
@@ -125,6 +227,11 @@ def live_transcription_worker(session_id):
 
         loop_wav_path = Path(settings.paths.tmp_dir) / f"{session_id}-loop.wav"
         mic_wav_path  = Path(settings.paths.tmp_dir) / f"{session_id}-mic.wav"
+        # Bounded sibling file re-written each cycle -- see
+        # _extract_recent_audio_window's docstring for why transcribing only
+        # this window (instead of the whole growing recording) is the fix for
+        # the O(n^2) hot path.
+        window_path = Path(settings.paths.tmp_dir) / f"{session_id}-live-window.wav"
 
         last_size = 0
         while active_session_id == session_id:
@@ -151,12 +258,17 @@ def live_transcription_worker(session_id):
             if current_size > last_size + 160000:  # ~5s of audio accumulated
                 last_size = current_size
                 try:
-                    segments, _ = model.transcribe(str(wav_path), beam_size=1, vad_filter=True)
+                    if not _extract_recent_audio_window(
+                        wav_path, _LIVE_TRANSCRIPTION_WINDOW_SECONDS, window_path
+                    ):
+                        continue
+                    segments, _ = model.transcribe(str(window_path), beam_size=1, vad_filter=True)
                     text = " ".join([s.text for s in segments])
                     if text.strip():
                         live_transcript = text
                 except Exception as e:
                     logger.debug("Live transcription chunk failed for %s: %s", session_id, e)
+        window_path.unlink(missing_ok=True)
     except ImportError:
         live_transcript = "[Live transcription unavailable: faster-whisper not installed]"
         logger.warning("Live transcriber: faster-whisper not installed")
@@ -177,7 +289,15 @@ async def sync_calendar_endpoint():
     try:
         from cli.teams_sync import fetch_outlook_calendar
         calendar_cache = Path(settings.paths.data_dir) / "calendar.json"
-        count = fetch_outlook_calendar(calendar_cache)
+        # Bug fix: fetch_outlook_calendar is a fully synchronous win32com
+        # call. This handler is `async def`, but previously called it
+        # directly (unlike apply_reviewed_update/export_all elsewhere in this
+        # file, which are correctly offloaded) -- since uvicorn runs
+        # single-worker here by design, a slow/first-touch COM round-trip
+        # froze the entire event loop, so the dashboard's own 5s polling and
+        # every other request appeared to hang for the sync's whole duration,
+        # which is most of why "click Sync" felt like it didn't do anything.
+        count = await asyncio.to_thread(fetch_outlook_calendar, calendar_cache)
         return {"status": "synced", "count": count}
     except Exception as e:
         logger.warning("Calendar sync failed: %s", e)
@@ -188,13 +308,35 @@ async def get_briefing():
     from fastapi.encoders import jsonable_encoder
     todo_path = Path(settings.paths.data_dir) / "todo.md"
     state_dir = Path(settings.paths.data_dir) / "state"
-    briefing = build_daily_briefing(todo_path, state_dir)
+    # Bug fix: build_daily_briefing scans every session state file and
+    # parses the whole of todo.md on every call -- negligible today, but this
+    # endpoint is polled every 5s for as long as the dashboard tab is open,
+    # and was previously called synchronously on the event loop thread,
+    # blocking all other requests (SSE live-transcript, any other tab) for
+    # its duration. Offloaded the same way other blocking calls in this file
+    # already are; the cost only grows with total session/todo.md history, so
+    # this heads off the same class of freeze the calendar-sync fix
+    # addressed, before it becomes noticeable.
+    briefing = await asyncio.to_thread(build_daily_briefing, todo_path, state_dir)
     # Add our global processing state
     global processing, pipeline_error, pipeline_stage
     briefing["processing"] = processing
     briefing["pipeline_stage"] = pipeline_stage
     briefing["recording"] = len(recording_processes) > 0
     briefing["error"] = pipeline_error
+
+    # Reuse the sessions dict pipeline_status() already computed above (via
+    # build_daily_briefing) rather than re-parsing pending-review drafts here
+    # -- this only needs a count, and the dashboard polls this endpoint every
+    # 5s, so a second parse pass per poll would be wasted work. Lets the
+    # #review-badge nav counter (static/app.js's updateUI) stay current even
+    # while the user is on a different tab, instead of only refreshing when
+    # loadReviewQueue() is explicitly called (tab-switch or post-decision).
+    sessions_status = briefing.get("sessions") or {}
+    briefing["review_pending_count"] = (
+        len(sessions_status.get("awaiting_review", []))
+        + len(sessions_status.get("awaiting_apply", []))
+    )
 
     # bugfix-02 Fix F: the recording's true start time so a browser refresh
     # doesn't reset the client's elapsed-time reference to Date.now(). No new
@@ -294,7 +436,8 @@ async def _start_recording_locked(req: StartRecordRequest | None) -> dict:
     # (architecture_v2.md §4); write it now so it exists before session state
     # does (state is only created later, in `process`/run_pipeline).
     if req and req.meeting_type:
-        (meetings_dir / f"{active_session_id}.type").write_text(req.meeting_type, encoding="utf-8")
+        from mcp_server.meeting_type import write_meeting_type
+        write_meeting_type(meetings_dir, active_session_id, req.meeting_type)
 
     # Save context if provided
     if req and req.context:
@@ -361,7 +504,12 @@ async def log_highlight(req: HighlightRequest | None = None):
             entry["segment_offset_seconds"] = req.segment_offset_seconds
         highlights.append(entry)
 
-    highlight_path.write_text(json.dumps(highlights), encoding="utf-8")
+    # atomic_write_text rather than a plain write_text: this is a
+    # read-modify-write of a JSON list, called repeatedly while a recording
+    # is live -- a crash mid-write previously risked truncating/corrupting
+    # highlights.json, which extract_action_items also reads back into the
+    # extraction prompt.
+    atomic_write_text(highlight_path, json.dumps(highlights))
     return {"status": "highlight_logged"}
 
 _SUPPORTED_DOC_SUFFIXES = {".pdf", ".pptx", ".docx", ".txt"}
@@ -591,11 +739,7 @@ async def run_extraction_only(session_id: str) -> None:
         _fail_session_best_effort(session_id, e)
     finally:
         if serve_proc is not None:
-            serve_proc.terminate()
-            try:
-                serve_proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                serve_proc.kill()
+            await asyncio.to_thread(_terminate_and_wait, serve_proc, 10)
         processing = False
 
 
@@ -694,7 +838,7 @@ async def upload_transcript(
             initial_state=state_mod.State.STOPPED, meeting_type=meeting_type, source="import",
             whisper_model="imported", **calendar_metadata,
         )
-        type_file_path(meetings_dir, session_id).write_text(meeting_type, encoding="utf-8")
+        write_meeting_type(meetings_dir, session_id, meeting_type)
 
         result = TranscriptionResult(
             session_id=session_id,
@@ -724,6 +868,40 @@ async def upload_transcript(
     asyncio.create_task(run_extraction_only(session_id))
 
     return JSONResponse({"status": "importing", "session_id": session_id, "segments_count": len(segments)})
+
+
+def _terminate_and_wait(proc: subprocess.Popen, timeout_seconds: float) -> None:
+    """terminate() then wait() with a kill() fallback on timeout -- the same
+    three-line pattern this file previously repeated inline at every
+    subprocess-shutdown site (run_pipeline's and run_extraction_only's
+    LLM-shutdown `finally` blocks, and POST /api/server/llm/stop), each of
+    them blocking the event loop for up to the full timeout since the calls
+    were made directly inside `async def` functions/coroutines. Callers
+    should `await asyncio.to_thread(_terminate_and_wait, proc, timeout)`."""
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def _wait_for_recording_processes_to_stop(processes: list[subprocess.Popen], grace_seconds: float) -> None:
+    """Blocking wait for the mic/loopback recorder subprocesses to exit after
+    their stop-sentinel files are touched, falling back to terminate() for
+    any that don't. Pulled out into its own function so stop_recording can
+    run it via asyncio.to_thread instead of blocking the event loop for the
+    whole grace period (see the call site's comment)."""
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if all(p.poll() is not None for p in processes):
+            break
+        time.sleep(0.1)
+
+    for p in processes:
+        if p.poll() is None:
+            logger.warning("Record subprocess did not exit within grace period; force-killing.")
+            p.terminate()
+            p.wait(timeout=2)
 
 
 @app.post("/api/record/stop")
@@ -760,18 +938,13 @@ async def stop_recording(auto_accept: bool = False, session_id: str | None = Non
     for sub_id in [f"{sess_id}-mic", f"{sess_id}-loop"]:
         (tmp_dir / f"{sub_id}.stop").touch()
 
-    # Wait up to 4 s for processes to exit cleanly; fall back to terminate()
-    deadline = time.monotonic() + 4.0
-    while time.monotonic() < deadline:
-        if all(p.poll() is not None for p in recording_processes):
-            break
-        time.sleep(0.1)
-
-    for p in recording_processes:
-        if p.poll() is None:
-            logger.warning("Record subprocess did not exit within grace period; force-killing.")
-            p.terminate()
-            p.wait(timeout=2)
+    # Bug fix: this wait/terminate loop is blocking (time.sleep, Popen.wait)
+    # and used to run directly inside this async def handler -- for up to
+    # ~4-6s, every other request (the dashboard's 5s polling, the live-
+    # transcript SSE stream, any other tab) froze, since uvicorn runs
+    # single-worker here by design. Offloaded to a thread, same pattern
+    # already used elsewhere in this file for other blocking calls.
+    await asyncio.to_thread(_wait_for_recording_processes_to_stop, recording_processes, 4.0)
 
     recording_processes = []
     active_session_id = None
@@ -1059,11 +1232,7 @@ async def run_pipeline(session_id: str, auto_accept: bool = False, whisper_model
             # Only stop the server if we started it; if it was already running
             # we leave it alone so the user's pre-warmed instance stays up.
             logger.info("[%s] Stopping LLM Server (started by this pipeline run)...", session_id)
-            serve_proc.terminate()
-            try:
-                serve_proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                serve_proc.kill()
+            await asyncio.to_thread(_terminate_and_wait, serve_proc, 10)
         else:
             logger.info("[%s] LLM server was pre-existing — left running.", session_id)
         # SB-2.1: ensure active_session_id and recording_processes are cleared even
@@ -1213,6 +1382,20 @@ async def post_review_decide(req: ReviewDecideRequest):
     except FileNotFoundError as exc:
         return JSONResponse({"error": str(exc)}, status_code=404)
 
+    # Bug fix: pipeline_stage is set to "AWAITING_REVIEW" by run_pipeline once
+    # a session reaches PROPOSED (see that function's tail), but nothing ever
+    # cleared it again once the human actually acted on the review -- the
+    # Dashboard tab's "Ready for Review" banner kept showing indefinitely
+    # until some *other* pipeline run happened to overwrite the global. Reset
+    # only on a successful decision (not on the error returns above, so a
+    # rejected/invalid request doesn't mask a genuinely still-in-flight
+    # pipeline). Unconditional otherwise: this module is single-process/
+    # single-session by design (see the recording_processes/processing
+    # globals' own docstrings), so there is no concurrent session whose stage
+    # this could clobber.
+    global pipeline_stage
+    pipeline_stage = None
+
     # Fix 3.4: record rejections as feedback for future extraction prompts.
     from cli.feedback import record_rejection as _record_rejection
 
@@ -1340,6 +1523,14 @@ async def post_review_apply(req: ReviewApplyRequest):
         return JSONResponse({"error": str(exc)}, status_code=404)
     except TodoFileUnparsableError as exc:
         return JSONResponse({"error": str(exc)}, status_code=422)
+
+    # Bug fix (defensive, mirrors post_review_decide above): reset
+    # pipeline_stage on a successful apply too, in case a session was decided
+    # via the CLI's own `review` command and only applied through the web
+    # dashboard here -- post_review_decide never ran in this process for that
+    # session, so its reset wouldn't have fired.
+    global pipeline_stage
+    pipeline_stage = None
 
     return JSONResponse({
         "session_id": req.session_id,
@@ -1592,12 +1783,8 @@ async def llm_stop():
 
     # Kill the process we track explicitly
     if _llm_server_proc is not None and _llm_server_proc.poll() is None:
-        _llm_server_proc.terminate()
-        try:
-            _llm_server_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            _llm_server_proc.kill()
         killed.append(_llm_server_proc.pid)
+        await asyncio.to_thread(_terminate_and_wait, _llm_server_proc, 5)
     _llm_server_proc = None
 
     # Also kill any orphaned llama-server processes (from pipeline runs or prior sessions)
@@ -1741,9 +1928,15 @@ async def patch_settings(req: SettingsPatchRequest):
         if count == 0:
             return JSONResponse({"error": "Could not locate [whisper].diarisation_enabled in settings.toml"}, status_code=500)
 
-    tmp_path = DEFAULT_SETTINGS_PATH.with_suffix(".toml.tmp")
-    tmp_path.write_text(new_text, encoding="utf-8")
-    tmp_path.replace(DEFAULT_SETTINGS_PATH)
+    # Bug fix: this used to hand-roll a tmp-write + rename without fsync()ing
+    # the tmp file first -- atomic against a torn read (another process never
+    # sees a half-written file), but not against power loss (a crash between
+    # the write and the rename could still lose the tmp file's contents on
+    # some filesystems/OS caches). atomic_write_text (already imported at the
+    # top of this module, and already used elsewhere in it) closes that gap
+    # with the same tmp+fsync+os.replace pattern used for every other
+    # artefact writer in this project.
+    atomic_write_text(DEFAULT_SETTINGS_PATH, new_text)
 
     global settings
     settings = load_settings(DEFAULT_SETTINGS_PATH)
@@ -1852,25 +2045,29 @@ class CompleteRequest(BaseModel):
 
 @app.post("/api/todo/complete")
 async def complete_task(req: CompleteRequest):
-    from mcp_server.todo import parse_todo, format_todo_file, TodoFileUnparsableError
+    """Mark a task done.
+
+    Bug fix: this endpoint used to write data/todo.md directly (a bare
+    `write_text`, no FileLock, no CapabilityToken, no atomic write) -- a
+    second, ungated path to the project's most-protected file, alongside
+    PATCH /api/tasks/{id} which goes through all three via
+    update_task_status(). Now delegates to that same function instead, so
+    the two "mark done" code paths share one write-safety mechanism and one
+    behavior: both now set status="done" (not just the done=True flag),
+    where this endpoint previously left status untouched. The request/
+    response shape is unchanged (still {"task_id": ...} in, {"status": ...}
+    out) so the existing frontend call site (completeTask() in app.js) needs
+    no changes."""
+    from cli.capability import mint_capability_token
+    from cli.review_apply import update_task_status
 
     todo_path = Path(settings.paths.data_dir) / "todo.md"
-    if not todo_path.exists():
-        return {"status": "error", "detail": "todo.md does not exist"}
-
+    token = mint_capability_token()
     try:
-        todo_file = parse_todo(todo_path)
-    except TodoFileUnparsableError as exc:
-        # Surfaced explicitly rather than silently rewriting an unparsable file
-        # with naive string matching, which risks corrupting it further.
-        return JSONResponse({"status": "error", "detail": str(exc)}, status_code=409)
-
-    found = False
-    for item in todo_file.items:
-        if item.id == req.task_id:
-            item.done = True
-            found = True
-
-    if found:
-        todo_path.write_text(format_todo_file(todo_file), encoding="utf-8")
-    return {"status": "success" if found else "not_found"}
+        update_task_status(
+            token, req.task_id, {"status": "done"}, todo_path,
+            settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
+        )
+    except KeyError:
+        return {"status": "not_found"}
+    return {"status": "success"}
