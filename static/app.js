@@ -831,19 +831,47 @@ function switchTab(tabId) {
     if (tabId === 'project-meetings') loadTypeFilteredMeetings('project-meeting');
     if (tabId === 'seminars') loadTypeFilteredMeetings('seminar');
     if (tabId === 'settings') loadSettings();
+    if (tabId === 'projects') loadProjectsTab();
 }
 
 // ── Review / Apply UI ─────────────────────────────────────────────────────────
+
+// P2.5: the same 8-value owner_type vocabulary the extraction pipeline
+// classifies against (mcp_server/tools/extraction.py's _VALID_OWNER_TYPES) --
+// kept in sync by hand since the frontend has no import from the Python side.
+const _OWNER_TYPES = ['unknown', 'self', 'institution', 'partner', 'organisation', 'consortium', 'all_partners', 'external'];
+const _OWNER_TYPE_LABELS = {
+    unknown: 'Unknown', self: 'Me', institution: 'My Institution', partner: 'Partner Org',
+    organisation: 'My Org (entity)', consortium: 'Consortium', all_partners: 'All Partners', external: 'External',
+};
+
+// Cached across calls within one page load -- the active project list rarely
+// changes mid-review-session, and re-fetching on every loadReviewQueue() poll
+// would be wasted work for a picker that's just a few dozen entries at most.
+let _activeProjectsCache = null;
+async function _getActiveProjects() {
+    if (_activeProjectsCache) return _activeProjectsCache;
+    try {
+        const resp = await fetch('/api/projects');
+        if (!resp.ok) return [];
+        const data = await resp.json();
+        _activeProjectsCache = (data.projects || []).filter(p => p.status === 'active');
+        return _activeProjectsCache;
+    } catch (e) {
+        console.error('_getActiveProjects:', e);
+        return [];
+    }
+}
 
 async function loadReviewQueue() {
     const loading = document.getElementById('review-loading');
     if (loading) loading.style.display = '';
     try {
-        const resp = await fetch('/api/review/pending');
+        const [resp, activeProjects] = await Promise.all([fetch('/api/review/pending'), _getActiveProjects()]);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const data = await resp.json();
         if (loading) loading.style.display = 'none';
-        renderReviewAwaiting(data.awaiting_review || []);
+        renderReviewAwaiting(data.awaiting_review || [], activeProjects);
         renderReviewApply(data.awaiting_apply || []);
         // Update badge
         const total = (data.awaiting_review || []).length + (data.awaiting_apply || []).length;
@@ -872,7 +900,7 @@ function _qualityBadge(label, score, flags) {
     return html;
 }
 
-function renderReviewAwaiting(sessions) {
+function renderReviewAwaiting(sessions, activeProjects) {
     const container = document.getElementById('review-awaiting-list');
     if (!container) return;
     if (!sessions.length) {
@@ -891,26 +919,43 @@ function renderReviewAwaiting(sessions) {
             ${(s.quality_label) ? `<div style="margin-bottom:0.75rem;">${_qualityBadge(s.quality_label, s.quality_score, s.quality_flags)}</div>` : ''}
             ${s.items.length === 0
                 ? '<p style="color:var(--text-muted);">No items in draft.</p>'
-                : s.items.map(item => renderReviewItem(s.session_id, item)).join('')
+                : s.items.map(item => renderReviewItem(s.session_id, item, activeProjects || [])).join('')
             }
         </div>
     `).join('');
 }
 
-function renderReviewItem(sessionId, item) {
-    // Each item gets Accept/Reject radio + editable owner + due_date.
-    // Default is Accept (the common case); the user only has to act on rejects/edits.
+function renderReviewItem(sessionId, item, activeProjects) {
+    // Each item gets Accept/Reject radio + editable owner + due_date, plus
+    // (P2.5) the extraction pipeline's ownership classification -- shown as
+    // a confidence badge and editable owner_type/project select controls,
+    // so a wrong or low-confidence classification can be corrected before
+    // accepting rather than only after, via a separate task-edit pass.
     const safeId = escHtml(item.id);
     const safeDesc = escHtml(item.description);
     const safeOwner = escHtml(item.owner || '');
     const safeDue = escHtml(item.due_date || '');
+    const ownerType = _OWNER_TYPES.includes(item.owner_type) ? item.owner_type : 'unknown';
+    const ownerTypeOptions = _OWNER_TYPES.map(
+        t => `<option value="${t}" ${t === ownerType ? 'selected' : ''}>${escHtml(_OWNER_TYPE_LABELS[t])}</option>`
+    ).join('');
+    const projectOptions = ['<option value="">No project</option>'].concat(
+        (activeProjects || []).map(p => `<option value="${escHtml(p.id)}" ${p.id === item.project_id ? 'selected' : ''}>${escHtml(p.name)}</option>`)
+    ).join('');
+    const confidenceBadge = item.confidence != null
+        ? `<span style="font-size:0.72rem;color:var(--text-muted);margin-left:0.4rem;" title="Extraction confidence">${Math.round(item.confidence * 100)}%</span>`
+        : '';
+    const origOwnerType = escHtml(ownerType);
+    const origConfidence = item.confidence != null ? item.confidence : '';
+    const origInstitution = escHtml(item.institution || '');
     return `
-        <div class="task-card" id="item-${safeId}" style="margin-bottom:0.75rem;padding:0.75rem;border-left:3px solid var(--primary);">
+        <div class="task-card" id="item-${safeId}" style="margin-bottom:0.75rem;padding:0.75rem;border-left:3px solid var(--primary);"
+             data-orig-owner-type="${origOwnerType}" data-orig-confidence="${origConfidence}" data-orig-institution="${origInstitution}">
             <div style="display:flex;align-items:flex-start;gap:0.75rem;">
                 <div style="flex:1;">
                     <div style="font-weight:500;margin-bottom:0.4rem;">${safeDesc}</div>
                     ${item.evidence ? `<div class="evidence-quote">“${escHtml(item.evidence)}”</div>` : ''}
-                    <div style="display:flex;gap:0.75rem;flex-wrap:wrap;">
+                    <div style="display:flex;gap:0.75rem;flex-wrap:wrap;align-items:center;">
                         <label style="font-size:0.8rem;color:var(--text-muted);">Owner:
                             <input type="text" value="${safeOwner}"
                                    id="owner-${safeId}"
@@ -922,6 +967,20 @@ function renderReviewItem(sessionId, item) {
                                    id="due-${safeId}"
                                    style="background:var(--card-raised);border:1px solid var(--hairline-strong);
                                           border-radius:3px;color:var(--ink);padding:2px 6px;font-size:0.8rem;">
+                        </label>
+                        <label style="font-size:0.8rem;color:var(--text-muted);">Ownership:
+                            <select id="ownertype-${safeId}"
+                                    style="background:var(--card-raised);border:1px solid var(--hairline-strong);
+                                           border-radius:3px;color:var(--ink);padding:2px 6px;font-size:0.8rem;">
+                                ${ownerTypeOptions}
+                            </select>${confidenceBadge}
+                        </label>
+                        <label style="font-size:0.8rem;color:var(--text-muted);">Project:
+                            <select id="projectid-${safeId}"
+                                    style="background:var(--card-raised);border:1px solid var(--hairline-strong);
+                                           border-radius:3px;color:var(--ink);padding:2px 6px;font-size:0.8rem;">
+                                ${projectOptions}
+                            </select>
                         </label>
                     </div>
                 </div>
@@ -949,14 +1008,28 @@ async function submitReview(sessionId) {
         radios.forEach(r => { if (r.checked) decision = r.value; });
         const ownerEl = block.querySelector(`#owner-${rawId}`);
         const dueEl   = block.querySelector(`#due-${rawId}`);
+        const ownerTypeEl = block.querySelector(`#ownertype-${rawId}`);
+        const projectIdEl = block.querySelector(`#projectid-${rawId}`);
         // Recover description from the rendered text node
         const descEl  = el.querySelector('div[style*="font-weight"]');
+        const ownerType = ownerTypeEl ? ownerTypeEl.value : null;
+        // P2.5: if the reviewer changed owner_type from what extraction
+        // classified, treat that as a human-confirmed correction (confidence
+        // 1.0) rather than silently keeping the model's original confidence
+        // score attached to a value the model didn't actually produce.
+        const origOwnerType = el.dataset.origOwnerType || 'unknown';
+        const origConfidence = el.dataset.origConfidence !== '' ? parseFloat(el.dataset.origConfidence) : null;
+        const confidence = (ownerType && ownerType !== origOwnerType) ? 1.0 : origConfidence;
         decisions.push({
             id: rawId,
             decision,
             description: descEl ? descEl.textContent.trim() : '',
             owner: ownerEl ? (ownerEl.value.trim() || null) : null,
             due_date: dueEl ? (dueEl.value.trim() || null) : null,
+            owner_type: ownerType,
+            project_id: projectIdEl ? (projectIdEl.value || null) : null,
+            institution: el.dataset.origInstitution || null,
+            confidence,
         });
     }
     try {
@@ -1632,11 +1705,50 @@ function setTaskFilter(filter) {
     if (_lastTasksData) renderFullTaskList(_lastTasksData);
 }
 
+// P2.6: default mapping from the extraction pipeline's 8-value owner_type
+// vocabulary (mcp_server/tools/extraction.py's _VALID_OWNER_TYPES) onto the
+// 3 primary cross-project views the roadmap asked for. Not user-configurable
+// today -- a deliberate, documented default rather than an open question left
+// unresolved: "self" is unambiguously mine; "institution" and "organisation"
+// both describe the user's own institution (as a named colleague vs. as an
+// entity) so both bucket under Institution; "partner"/"consortium"/
+// "all_partners" all describe ownership outside the user's own institution
+// so all bucket under Partner. "external" and "unknown" deliberately map to
+// no bucket -- surfacing a low-confidence or out-of-project classification
+// as if it were confidently "mine" or affiliated would be misleading; those
+// items are still visible under the "All" filter.
+function _ownerBucket(ownerType) {
+    if (ownerType === 'self') return 'mine';
+    if (ownerType === 'institution' || ownerType === 'organisation') return 'institution';
+    if (ownerType === 'partner' || ownerType === 'consortium' || ownerType === 'all_partners') return 'partner';
+    return null;
+}
+
+function _todayIso() {
+    return new Date().toISOString().slice(0, 10);
+}
+
+function _isOverdue(t) {
+    return !!t.due_date && t.status !== 'done' && t.due_date < _todayIso();
+}
+
+function _isUpcoming(t) {
+    if (!t.due_date || t.status === 'done') return false;
+    const in7 = new Date();
+    in7.setDate(in7.getDate() + 7);
+    return t.due_date >= _todayIso() && t.due_date <= in7.toISOString().slice(0, 10);
+}
+
 function _filterTasks(tasks) {
     if (_taskFilter === 'all') return tasks;
     if (_taskFilter === 'active') return tasks.filter(t => (t.status || 'todo') === 'todo' || t.status === 'in_progress');
     if (_taskFilter === 'blocked') return tasks.filter(t => t.status === 'blocked');
     if (_taskFilter === 'done') return tasks.filter(t => t.status === 'done');
+    if (_taskFilter === 'mine' || _taskFilter === 'institution' || _taskFilter === 'partner') {
+        return tasks.filter(t => _ownerBucket(t.owner_type) === _taskFilter);
+    }
+    if (_taskFilter === 'overdue') return tasks.filter(_isOverdue);
+    if (_taskFilter === 'upcoming') return tasks.filter(_isUpcoming);
     return tasks;
 }
 
@@ -1723,6 +1835,167 @@ function renderFullTaskList(allTasks) {
             </div>
         `).join('');
     if (fullTaskCount) fullTaskCount.innerText = allTasks.length;
+}
+
+// ── Projects tab (P2.6) ──────────────────────────────────────────────────────
+
+function toggleAddProjectForm(show) {
+    const form = document.getElementById('add-project-form');
+    const shouldShow = show === undefined ? form.classList.contains('hidden') : show;
+    form.classList.toggle('hidden', !shouldShow);
+    if (shouldShow) {
+        document.getElementById('new-project-name').value = '';
+        document.getElementById('new-project-institutions').value = '';
+        document.getElementById('new-project-partners').value = '';
+        document.getElementById('new-project-description').value = '';
+        document.getElementById('add-project-error').textContent = '';
+        _validateAddProjectForm();
+        document.getElementById('new-project-name').focus();
+    }
+}
+
+function _validateAddProjectForm() {
+    const name = document.getElementById('new-project-name').value.trim();
+    document.getElementById('btn-save-project').disabled = name.length === 0;
+}
+
+function _splitCommaList(value) {
+    return value.split(',').map(s => s.trim()).filter(Boolean);
+}
+
+async function saveNewProject() {
+    const errorEl = document.getElementById('add-project-error');
+    const name = document.getElementById('new-project-name').value.trim();
+    if (!name) return;
+
+    const payload = {
+        name,
+        institutions: _splitCommaList(document.getElementById('new-project-institutions').value),
+        partners: _splitCommaList(document.getElementById('new-project-partners').value),
+        description: document.getElementById('new-project-description').value.trim() || null,
+    };
+
+    const btn = document.getElementById('btn-save-project');
+    btn.disabled = true;
+    errorEl.textContent = '';
+    try {
+        const resp = await fetch('/api/projects', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        toggleAddProjectForm(false);
+        // A newly created project must show up in the review UI's project
+        // picker too, not just here -- drop the cache so the next
+        // loadReviewQueue() re-fetches instead of serving the stale list.
+        _activeProjectsCache = null;
+        loadProjectsTab();
+    } catch (e) {
+        errorEl.textContent = e.message;
+        btn.disabled = false;
+    }
+}
+
+let _lastProjectsData = [];
+
+async function loadProjectsTab() {
+    const list = document.getElementById('projects-list');
+    const countEl = document.getElementById('projects-count');
+    if (!list) return;
+    try {
+        const resp = await fetch('/api/projects');
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        _lastProjectsData = data.projects || [];
+        if (countEl) countEl.innerText = _lastProjectsData.filter(p => p.status === 'active').length;
+        renderProjectsList(_lastProjectsData);
+    } catch (e) {
+        list.innerHTML = `<div class="empty-state">Failed to load projects: ${escHtml(e.message)}</div>`;
+        console.error('loadProjectsTab:', e);
+    }
+}
+
+function renderProjectsList(projects) {
+    const list = document.getElementById('projects-list');
+    if (!list) return;
+    if (!projects.length) {
+        list.innerHTML = '<div class="empty-state">No projects yet. Click "New Project" to create one.</div>';
+        return;
+    }
+    // Active projects first, then archived -- archived ones stay visible
+    // (never deleted, per the soft-delete convention) but shouldn't compete
+    // for attention at the top of the list.
+    const ordered = [...projects].sort((a, b) => (a.status === b.status) ? 0 : (a.status === 'active' ? -1 : 1));
+    list.innerHTML = ordered.map(p => renderProjectCard(p)).join('');
+}
+
+function renderProjectCard(p) {
+    const safeId = escHtml(p.id);
+    const isArchived = p.status === 'archived';
+    return `
+        <div class="glass-panel" id="project-card-${safeId}" style="margin-bottom:1rem;padding:1rem;${isArchived ? 'opacity:0.6;' : ''}">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:0.5rem;flex-wrap:wrap;">
+                <div>
+                    <div style="font-weight:600;font-size:1.02rem;">${escHtml(p.name)}${isArchived ? ' <span class="stamp" style="font-size:0.7rem;">Archived</span>' : ''}</div>
+                    ${p.institutions.length ? `<div style="font-size:0.8rem;color:var(--text-muted);margin-top:0.25rem;"><i class="fa-solid fa-building"></i> ${p.institutions.map(escHtml).join(', ')}</div>` : ''}
+                    ${p.partners.length ? `<div style="font-size:0.8rem;color:var(--text-muted);margin-top:0.15rem;"><i class="fa-solid fa-handshake"></i> ${p.partners.map(escHtml).join(', ')}</div>` : ''}
+                    ${p.description ? `<div style="font-size:0.85rem;margin-top:0.4rem;">${escHtml(p.description)}</div>` : ''}
+                </div>
+                <div style="display:flex;gap:0.5rem;flex-shrink:0;">
+                    <button class="btn-secondary" style="padding:6px 12px;font-size:0.8rem;" onclick="toggleProjectTasks('${safeId}')">
+                        <i class="fa-solid fa-list-check"></i> Tasks
+                    </button>
+                    ${!isArchived ? `
+                        <button class="btn-secondary" style="padding:6px 12px;font-size:0.8rem;" onclick="archiveProject('${safeId}', '${escHtml(p.name).replace(/'/g, "\\'")}')">
+                            <i class="fa-solid fa-box-archive"></i> Archive
+                        </button>` : ''}
+                </div>
+            </div>
+            <div id="project-tasks-${safeId}" class="hidden" style="margin-top:0.75rem;border-top:1px solid var(--hairline-strong);padding-top:0.75rem;"></div>
+        </div>`;
+}
+
+async function toggleProjectTasks(projectId) {
+    const panel = document.getElementById('project-tasks-' + projectId);
+    if (!panel) return;
+    const willShow = panel.classList.contains('hidden');
+    panel.classList.toggle('hidden', !willShow);
+    if (!willShow || panel.dataset.loaded === '1') return;
+    panel.innerHTML = '<div class="loading-shimmer"></div>';
+    try {
+        const resp = await fetch(`/api/projects/${projectId}/tasks`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        const tasks = data.tasks || [];
+        panel.innerHTML = tasks.length
+            ? tasks.map(_taskCardHtml).join('')
+            : '<div class="empty-state">No tasks linked to this project yet.</div>';
+        panel.dataset.loaded = '1';
+    } catch (e) {
+        panel.innerHTML = `<div class="empty-state">Failed to load tasks: ${escHtml(e.message)}</div>`;
+    }
+}
+
+async function archiveProject(projectId, projectName) {
+    const confirmed = await showConfirmModal({
+        title: 'Archive project',
+        body: `Archive "${projectName}"? Existing tasks will keep their link to it, but it will no longer appear as an option for new tasks.`,
+        confirmLabel: 'Archive',
+    });
+    if (!confirmed) return;
+    try {
+        const resp = await fetch(`/api/projects/${projectId}`, { method: 'DELETE' });
+        if (!resp.ok) {
+            const data = await resp.json();
+            throw new Error(data.error || `HTTP ${resp.status}`);
+        }
+        _activeProjectsCache = null;
+        loadProjectsTab();
+    } catch (e) {
+        showFetchError('Could not archive project: ' + e.message);
+    }
 }
 
 function _toggleNoteEditor(taskId) {

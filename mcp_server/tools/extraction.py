@@ -40,9 +40,11 @@ from pathlib import Path
 
 from llm.client import LLMClient
 from concurrency.atomic import atomic_write_text
+from config.loader import IdentityConfig
 from mcp_server import state as state_mod
 from mcp_server.meeting_type import MeetingType, load_meeting_type
 from mcp_server.mom_writer import write_mom
+from mcp_server.project import Project
 from mcp_server.schemas import validate_session_id
 
 logger = logging.getLogger(__name__)
@@ -78,6 +80,24 @@ The object must always include these two keys:
       provenance a reviewer sees as "why does this task exist". Copy the words
       actually spoken; do not paraphrase. Omit the key if no single quotable
       moment exists.
+  "owner_type": one of "self"|"institution"|"partner"|"organisation"|"consortium"|
+      "all_partners"|"external"|"unknown". Classify using the USER IDENTITY block
+      below (if provided): "self" = the user themselves said they will do it;
+      "institution" = a named colleague at the user's own institution; "partner"
+      = someone at ONE specific named partner organisation; "consortium" or
+      "all_partners" = an action owned collectively by the whole consortium or
+      by every partner organisation, not one named person; "organisation" = the
+      user's own institution acting as an entity, not a specific named person;
+      "external" = someone outside the project entirely (e.g. a vendor, an
+      unrelated third party). Default to "unknown" rather than guessing when the
+      transcript gives no clear ownership signal.
+  "confidence": a number from 0.0 to 1.0 -- your confidence in the "owner_type"
+      classification above. Use a low value (below 0.5) when genuinely unsure;
+      do not default to a high value out of habit.
+  "project_id": string|null -- if this item clearly belongs to one of the ACTIVE
+      PROJECTS listed below, copy that project's id EXACTLY as given there. Do
+      NOT invent a new project id or name, and do NOT guess a close-but-not-exact
+      match -- output null when none of the listed projects clearly match.
 If there are no action items, "action_items" should be [].
 
 INTELLIGENT CONTEXT INFERENCE:
@@ -161,8 +181,72 @@ _LIST_SUPPLEMENTARY_KEYS = (
 _SCALAR_SUPPLEMENTARY_KEYS = ("continuation_summary", "next_meeting", "project", "speaker", "topic")
 
 
+# P2: the full owner_type vocabulary the model may output. Kept as a single
+# source of truth here so _normalize_action_item_ownership below and the
+# prompt contract above can never drift apart.
+_VALID_OWNER_TYPES = {
+    "self", "institution", "partner", "organisation",
+    "consortium", "all_partners", "external", "unknown",
+}
+
+
 class ExtractionError(RuntimeError):
     """Raised when the model's response cannot be interpreted as action items."""
+
+
+def _build_identity_context(identity: IdentityConfig | None) -> str:
+    """Small, fixed-size USER IDENTITY block the model classifies owner_type
+    against. Deliberately omitted entirely (not emitted as an empty/"not
+    configured" block) when identity.name is blank -- an unconfigured
+    identity should degrade to every item defaulting "unknown" rather than
+    the model trying to infer "self" from nothing."""
+    if identity is None or not identity.name.strip():
+        return ""
+    lines = [f"\n\nUSER IDENTITY (for owner_type classification):\nName: {identity.name}"]
+    if identity.aliases:
+        lines.append(f"Also referred to as: {', '.join(identity.aliases)}")
+    if identity.institution.strip():
+        lines.append(f"Institution: {identity.institution}")
+    return "\n".join(lines) + "\n"
+
+
+def _build_active_projects_context(active_projects: list[Project] | None) -> str:
+    """Small, fixed-size ACTIVE PROJECTS block the model matches project_id
+    against. Only active (non-archived) projects are listed -- matching a
+    task to an archived project would be a confusing UX default even if the
+    LLM could technically find the name in the transcript."""
+    if not active_projects:
+        return ""
+    active = [p for p in active_projects if p.status == "active"]
+    if not active:
+        return ""
+    lines = ["\n\nACTIVE PROJECTS (match project_id against these EXACTLY, never invent a new one):"]
+    for p in active:
+        lines.append(f'  id="{p.id}" name="{p.name}"')
+    return "\n".join(lines) + "\n"
+
+
+def _normalize_action_item_ownership(action_items: list[dict], active_projects: list[Project] | None) -> list[dict]:
+    """Server-side backstop for the "match, never silently create" contract
+    (P2): the prompt tells the model not to invent an owner_type outside the
+    vocabulary or a project_id outside the active list, but a model is not a
+    validator -- an out-of-vocabulary owner_type, a malformed confidence, or
+    a project_id that doesn't match any known project id is coerced to a
+    safe default here rather than trusted verbatim."""
+    valid_project_ids = {p.id for p in (active_projects or []) if p.id}
+    for item in action_items:
+        owner_type = item.get("owner_type")
+        if owner_type not in _VALID_OWNER_TYPES:
+            item["owner_type"] = "unknown"
+        confidence = item.get("confidence")
+        if not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not (0.0 <= confidence <= 1.0):
+            item["confidence"] = None
+        else:
+            item["confidence"] = float(confidence)
+        project_id = item.get("project_id")
+        if project_id is not None and project_id not in valid_project_ids:
+            item["project_id"] = None
+    return action_items
 
 
 def extract_action_items(
@@ -174,6 +258,8 @@ def extract_action_items(
     llm_client: LLMClient,
     meeting_type: MeetingType | None = None,
     recording_date: datetime | None = None,
+    identity: IdentityConfig | None = None,
+    active_projects: list[Project] | None = None,
 ) -> dict:
     validate_session_id(session_id)
     meetings_dir = Path(meetings_dir)
@@ -213,6 +299,14 @@ def extract_action_items(
     todo_ctx = _build_todo_context(todo_path)
     if todo_ctx:
         additional_context += f"\n\nCURRENT TASK CONTEXT (todo.md — active items only):\n{todo_ctx}\n"
+
+    # P2: USER IDENTITY + ACTIVE PROJECTS blocks the owner_type/project_id
+    # contract above classifies against. Both are small/fixed-size by
+    # construction (one identity, a handful of active projects) so this is
+    # negligible against the tight token budget noted in this module's
+    # docstring.
+    additional_context += _build_identity_context(identity)
+    additional_context += _build_active_projects_context(active_projects)
 
     # SB-4.1 / Fix 2.2: session chaining with meeting-type filter and clear labelling.
     chaining_ctx = _load_prior_sessions(session_id, meetings_dir, meeting_type)
@@ -281,6 +375,7 @@ def extract_action_items(
         raise
 
     result["action_items"] = link_dependencies(result.get("action_items", []))
+    result["action_items"] = _normalize_action_item_ownership(result["action_items"], active_projects)
     result["recording_date"] = recording_date.date().isoformat()
 
     actions_path = meetings_dir / f"{session_id}.actions.json"

@@ -144,6 +144,30 @@ def test_pending_returns_items_for_proposed_session(client):
     assert sess["items"][0]["owner"] == "Alice"
 
 
+def test_pending_returns_ownership_fields(client):
+    """P2.5: GET /api/review/pending must surface owner_type/confidence/
+    project_id/institution so the review UI can show/let a human override
+    the extraction pipeline's classification."""
+    c, dirs = client
+    lines = [
+        "# Proposed todo updates -- session s1", "",
+        '- [ ] Do the thing <!-- meta: {"id": "aaa111", "owner": "Alice", '
+        '"due_date": null, "session_id": "s1", "owner_type": "institution", '
+        '"confidence": 0.75, "project_id": "proj-42", "institution": "UREAD"} -->',
+    ]
+    create_session(dirs["state_dir"], "s1", dirs["lock_path"], 1.0, initial_state=State.EXTRACTED)
+    transition(dirs["state_dir"], "s1", State.PROPOSED, dirs["lock_path"], 1.0)
+    (dirs["pending_review_dir"] / "s1.md").write_text("\n".join(lines) + "\n")
+
+    resp = c.get("/api/review/pending")
+    assert resp.status_code == 200
+    item = resp.json()["awaiting_review"][0]["items"][0]
+    assert item["owner_type"] == "institution"
+    assert item["confidence"] == 0.75
+    assert item["project_id"] == "proj-42"
+    assert item["institution"] == "UREAD"
+
+
 def test_pending_shows_reviewed_sessions_in_awaiting_apply(client):
     c, dirs = client
     items = [{"id": "aaa111", "description": "Send memo", "owner": "Bob", "due_date": None}]
@@ -233,6 +257,30 @@ def test_decide_with_edited_owner_and_due_date(client):
     assert entry["description"] == "New desc"
     assert entry["owner"] == "Charlie"
     assert entry["due_date"] == "2026-08-01"
+
+
+def test_decide_carries_ownership_overrides_into_reviewed_json(client):
+    """A reviewer editing owner_type/project_id in the UI before submit must
+    have that override land in the reviewed.json (and, downstream, on the
+    applied TodoItem -- covered separately in test_review_apply.py)."""
+    c, dirs = client
+    items = [{"id": "ccc333", "description": "Do X", "owner": "Bob", "due_date": None}]
+    _advance_to_proposed(dirs, "s1", items)
+
+    resp = c.post("/api/review/decide", json={
+        "session_id": "s1",
+        "decisions": [{
+            "id": "ccc333", "decision": "accept", "description": "Do X", "owner": "Bob",
+            "owner_type": "self", "project_id": "proj-1", "institution": "UREAD", "confidence": 0.6,
+        }],
+    })
+    assert resp.status_code == 200
+    reviewed = json.loads((dirs["pending_review_dir"] / "s1.reviewed.json").read_text())
+    entry = reviewed[0]
+    assert entry["owner_type"] == "self"
+    assert entry["project_id"] == "proj-1"
+    assert entry["institution"] == "UREAD"
+    assert entry["confidence"] == 0.6
 
 
 def test_decide_wrong_state_returns_409(client):

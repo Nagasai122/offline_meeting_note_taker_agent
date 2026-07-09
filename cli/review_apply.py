@@ -39,6 +39,17 @@ class ReviewDecision:
     session_id: str | None
     priority: str | None = None
     evidence: str | None = None
+    # P2.5: the extraction pipeline's ownership classification, carried
+    # through the draft (mcp_server/tools/review.py's propose_todo_update)
+    # so a human reviewer can see -- and, by editing these before submitting,
+    # override -- a low-confidence or wrong classification. Same
+    # full-round-trip convention as owner/due_date/priority/evidence above,
+    # not a delta: the reviewer's submitted value (edited or not) is what
+    # ends up on the applied TodoItem.
+    owner_type: str | None = None
+    project_id: str | None = None
+    institution: str | None = None
+    confidence: float | None = None
 
 
 def load_pending_items(pending_review_path: Path | str) -> list[TodoItem]:
@@ -61,6 +72,8 @@ def write_reviewed_decisions(reviewed_path: Path | str, decisions: list[ReviewDe
             "id": d.id, "decision": d.decision, "description": d.description,
             "owner": d.owner, "due_date": d.due_date, "session_id": d.session_id,
             "priority": d.priority, "evidence": d.evidence,
+            "owner_type": d.owner_type, "project_id": d.project_id,
+            "institution": d.institution, "confidence": d.confidence,
         }
         for d in decisions
     ]
@@ -202,6 +215,8 @@ def apply_reviewed_update(
                 owner=decision.owner, due_date=decision.due_date, session_id=decision.session_id,
                 priority=decision.priority, status="todo", source=decision.session_id,
                 evidence=decision.evidence,
+                owner_type=decision.owner_type, project_id=decision.project_id,
+                institution=decision.institution, confidence=decision.confidence,
             )
         )
 

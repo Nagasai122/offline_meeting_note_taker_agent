@@ -8,7 +8,7 @@ filesystem side effects beyond reading the one file it's given.
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 if sys.version_info >= (3, 11):
@@ -73,6 +73,20 @@ class ExportConfig:
 
 
 @dataclass(frozen=True)
+class IdentityConfig:
+    # Who "self" means for ownership classification (P2) -- the extraction
+    # pipeline injects this into the LLM's context so it can tell "I will
+    # send the report" (owner_type="self") apart from "Maria will send the
+    # report" (owner_type="institution"/"partner"/etc.) in a transcript.
+    # Empty name = not configured; ownership classification falls back to
+    # "unknown" rather than guessing, same fail-closed posture as everywhere
+    # else the LLM is asked to classify rather than invent.
+    name: str = ""
+    aliases: list[str] = field(default_factory=list)
+    institution: str = ""
+
+
+@dataclass(frozen=True)
 class Settings:
     paths: PathsConfig
     llm: LLMConfig
@@ -81,6 +95,7 @@ class Settings:
     concurrency: ConcurrencyConfig
     agent: AgentConfig
     export: ExportConfig = ExportConfig()
+    identity: IdentityConfig = IdentityConfig()
 
 
 def load_settings(path: Path) -> Settings:
@@ -92,8 +107,10 @@ def load_settings(path: Path) -> Settings:
         whisper=WhisperConfig(**raw["whisper"]),
         privacy=PrivacyConfig(**raw["privacy"]),
         concurrency=ConcurrencyConfig(**raw["concurrency"]),
-        # [agent] and [export] are optional in settings.toml -- defaults above
-        # keep older config files (M1-M4 era) loading without modification.
+        # [agent], [export], and [identity] are optional in settings.toml --
+        # defaults above keep older config files (M1-M4 era) loading without
+        # modification.
         agent=AgentConfig(**raw.get("agent", {})),
         export=ExportConfig(**raw.get("export", {})),
+        identity=IdentityConfig(**raw.get("identity", {})),
     )

@@ -1241,6 +1241,8 @@ async def run_pipeline(session_id: str, auto_accept: bool = False, whisper_model
                         id=item.id, decision="accept", description=item.description,
                         owner=item.owner, due_date=item.due_date, session_id=item.session_id,
                         priority=item.priority, evidence=item.evidence,
+                        owner_type=item.owner_type, project_id=item.project_id,
+                        institution=item.institution, confidence=item.confidence,
                     )
                     for item in pending_items
                 ]
@@ -1355,6 +1357,13 @@ async def get_review_pending():
                     "due_date": item.due_date,
                     "priority": item.priority,
                     "evidence": item.evidence,
+                    # P2.5: surfaced so the review UI can show/let a human
+                    # override the extraction pipeline's ownership
+                    # classification before accepting.
+                    "owner_type": item.owner_type,
+                    "confidence": item.confidence,
+                    "project_id": item.project_id,
+                    "institution": item.institution,
                 }
                 for item in items
             ],
@@ -1377,6 +1386,13 @@ class ReviewItemDecision(BaseModel):
     priority: str | None = None
     evidence: str | None = None
     rejection_reason: str | None = None  # Fix 3.4: optional reason for rejections
+    # P2.5: round-tripped from GET /api/review/pending, editable by the
+    # reviewer in the UI before submit -- same full-value (not delta)
+    # convention as owner/due_date/priority above.
+    owner_type: str | None = None
+    project_id: str | None = None
+    institution: str | None = None
+    confidence: float | None = None
 
 
 class ReviewDecideRequest(BaseModel):
@@ -1418,6 +1434,10 @@ async def post_review_decide(req: ReviewDecideRequest):
             session_id=req.session_id,
             priority=d.priority,
             evidence=d.evidence,
+            owner_type=d.owner_type,
+            project_id=d.project_id,
+            institution=d.institution,
+            confidence=d.confidence,
         )
         for d in req.decisions
     ]
@@ -1985,12 +2005,18 @@ async def get_settings():
     return JSONResponse({
         "whisper_model": settings.whisper.model,
         "diarisation_enabled": settings.whisper.diarisation_enabled,
+        "identity_name": settings.identity.name,
+        "identity_aliases": settings.identity.aliases,
+        "identity_institution": settings.identity.institution,
     })
 
 
 class SettingsPatchRequest(BaseModel):
     whisper_model: str | None = None
     diarisation_enabled: bool | None = None
+    identity_name: str | None = None
+    identity_aliases: list[str] | None = None
+    identity_institution: str | None = None
 
 
 @app.patch("/api/settings")
@@ -2000,7 +2026,11 @@ async def patch_settings(req: SettingsPatchRequest):
     tomllib-parse + re-serialise round trip, since Python's stdlib TOML
     support is read-only and a full rewrite would silently drop comments in
     a file the user may hand-edit -- see architecture_v2.md deviation notes."""
-    if req.whisper_model is None and req.diarisation_enabled is None:
+    if (
+        req.whisper_model is None and req.diarisation_enabled is None
+        and req.identity_name is None and req.identity_aliases is None
+        and req.identity_institution is None
+    ):
         return JSONResponse({"status": "no_changes"})
 
     text = DEFAULT_SETTINGS_PATH.read_text(encoding="utf-8")
@@ -2024,6 +2054,55 @@ async def patch_settings(req: SettingsPatchRequest):
         )
         if count == 0:
             return JSONResponse({"error": "Could not locate [whisper].diarisation_enabled in settings.toml"}, status_code=500)
+    # Bug fix: [whisper]'s "stay within this section" guard (`[^\[]*?` above)
+    # relies on no field value ever containing a literal `[` -- true for
+    # whisper's scalars, but [identity].aliases is a TOML array literal
+    # (`aliases = []`), so a `[^\[]*?` guard used for a field appearing AFTER
+    # aliases in the file (institution, in the shipped settings.toml) could
+    # never cross that `[` and always failed to match (count == 0, 500
+    # response) -- even though .name (which appears before aliases) worked
+    # fine, making the bug easy to miss with a name-only test. `(?:(?!\n\[)
+    # [\s\S])*?` instead only refuses to cross an actual new "\n[section]"
+    # header, so a `[`/`]` inside a same-line array value is harmless.
+    # The whole prefix (section guard + key) must live INSIDE the capturing
+    # group -- re.subn's replacement below only re-emits m.group(1), so
+    # anything matched outside that group (including the "[identity]"
+    # header itself) would otherwise be silently dropped from the output.
+    _IDENTITY_SECTION_GUARD = r'\[identity\](?:(?!\n\[)[\s\S])*?'
+    if req.identity_name is not None:
+        if len(req.identity_name) > 200:
+            return JSONResponse({"error": "identity_name must be at most 200 characters."}, status_code=422)
+        new_text, count = re.subn(
+            r'(' + _IDENTITY_SECTION_GUARD + r'\bname\s*=\s*)"[^"]*"',
+            lambda m: f'{m.group(1)}"{req.identity_name}"',
+            new_text, count=1,
+        )
+        if count == 0:
+            return JSONResponse({"error": "Could not locate [identity].name in settings.toml"}, status_code=500)
+    if req.identity_institution is not None:
+        if len(req.identity_institution) > 200:
+            return JSONResponse({"error": "identity_institution must be at most 200 characters."}, status_code=422)
+        new_text, count = re.subn(
+            r'(' + _IDENTITY_SECTION_GUARD + r'\binstitution\s*=\s*)"[^"]*"',
+            lambda m: f'{m.group(1)}"{req.identity_institution}"',
+            new_text, count=1,
+        )
+        if count == 0:
+            return JSONResponse({"error": "Could not locate [identity].institution in settings.toml"}, status_code=500)
+    if req.identity_aliases is not None:
+        if len(req.identity_aliases) > 20 or any(len(a) > 100 for a in req.identity_aliases):
+            return JSONResponse(
+                {"error": "identity_aliases must have at most 20 entries of at most 100 characters each."},
+                status_code=422,
+            )
+        aliases_literal = "[" + ", ".join(json.dumps(a) for a in req.identity_aliases) + "]"
+        new_text, count = re.subn(
+            r'(' + _IDENTITY_SECTION_GUARD + r'\baliases\s*=\s*)\[[^\]]*\]',
+            lambda m: f'{m.group(1)}{aliases_literal}',
+            new_text, count=1,
+        )
+        if count == 0:
+            return JSONResponse({"error": "Could not locate [identity].aliases in settings.toml"}, status_code=500)
 
     # Bug fix: this used to hand-roll a tmp-write + rename without fsync()ing
     # the tmp file first -- atomic against a torn read (another process never
@@ -2041,6 +2120,9 @@ async def patch_settings(req: SettingsPatchRequest):
         "status": "saved",
         "whisper_model": settings.whisper.model,
         "diarisation_enabled": settings.whisper.diarisation_enabled,
+        "identity_name": settings.identity.name,
+        "identity_aliases": settings.identity.aliases,
+        "identity_institution": settings.identity.institution,
     })
 
 
@@ -2375,3 +2457,182 @@ async def complete_task(req: CompleteRequest):
     except KeyError:
         return {"status": "not_found"}
     return {"status": "success"}
+
+
+# ── Project CRUD (P2.2 — structured Project/Institution entity) ────────────────
+
+_MAX_PROJECT_NAME_LEN = 200
+_MAX_PROJECT_DESCRIPTION_LEN = 1000
+_MAX_PROJECT_LIST_ENTRIES = 20
+_MAX_PROJECT_LIST_ENTRY_LEN = 200
+_VALID_PROJECT_STATUSES = {"active", "archived"}
+
+
+def _validate_project_list_field(value: list[str] | None, field_name: str) -> str | None:
+    """Shared validation for institutions/partners -- both are short lists of
+    short strings, same shape, same limits."""
+    if value is None:
+        return None
+    if len(value) > _MAX_PROJECT_LIST_ENTRIES:
+        return f"{field_name} must have at most {_MAX_PROJECT_LIST_ENTRIES} entries."
+    for entry in value:
+        if not isinstance(entry, str) or not entry.strip():
+            return f"{field_name} entries must be non-empty strings."
+        if len(entry) > _MAX_PROJECT_LIST_ENTRY_LEN:
+            return f"{field_name} entries must be at most {_MAX_PROJECT_LIST_ENTRY_LEN} characters."
+    return None
+
+
+def _project_to_dict(project) -> dict:
+    return {
+        "id": project.id, "name": project.name, "institutions": project.institutions,
+        "partners": project.partners, "status": project.status,
+        "description": project.description, "created_at": project.created_at,
+    }
+
+
+@app.get("/api/projects")
+async def list_projects():
+    """Read-only lookup for the Projects tab and the project_id picker on the
+    manual-task/task-edit forms -- no capability token needed (read, not
+    write), same as GET /api/tasks/{id} above."""
+    from mcp_server.project import parse_projects
+
+    projects_path = Path(settings.paths.data_dir) / "projects.md"
+    # Offloaded the same way get_task/get_briefing are, so a large
+    # projects.md or lock contention elsewhere doesn't freeze the
+    # single-worker event loop.
+    project_file = await asyncio.to_thread(parse_projects, projects_path)
+    return JSONResponse({"projects": [_project_to_dict(p) for p in project_file.projects]})
+
+
+class ProjectCreateRequest(BaseModel):
+    name: str
+    institutions: list[str] | None = None
+    partners: list[str] | None = None
+    description: str | None = None
+
+
+@app.post("/api/projects")
+async def create_project_endpoint(req: ProjectCreateRequest):
+    from cli.capability import mint_capability_token
+    from cli.project_apply import create_project
+
+    name = req.name.strip()
+    if not name or len(name) > _MAX_PROJECT_NAME_LEN:
+        return JSONResponse(
+            {"error": f"name must be non-empty and at most {_MAX_PROJECT_NAME_LEN} characters."},
+            status_code=422,
+        )
+    if req.description and len(req.description) > _MAX_PROJECT_DESCRIPTION_LEN:
+        return JSONResponse(
+            {"error": f"description must be at most {_MAX_PROJECT_DESCRIPTION_LEN} characters."},
+            status_code=422,
+        )
+    for field_name, value in (("institutions", req.institutions), ("partners", req.partners)):
+        error = _validate_project_list_field(value, field_name)
+        if error:
+            return JSONResponse({"error": error}, status_code=422)
+
+    projects_path = Path(settings.paths.data_dir) / "projects.md"
+    token = mint_capability_token()
+    project_id = await asyncio.to_thread(
+        create_project,
+        token,
+        {
+            "name": name, "institutions": req.institutions, "partners": req.partners,
+            "description": req.description,
+        },
+        projects_path, settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
+    )
+    return JSONResponse({"project_id": project_id, "status": "created"})
+
+
+class ProjectPatchRequest(BaseModel):
+    name: str | None = None
+    institutions: list[str] | None = None
+    partners: list[str] | None = None
+    status: str | None = None
+    description: str | None = None
+
+
+@app.patch("/api/projects/{project_id}")
+async def patch_project(project_id: str, req: ProjectPatchRequest):
+    from cli.capability import mint_capability_token
+    from cli.project_apply import update_project
+
+    name_update = req.name
+    if req.name is not None:
+        name_update = req.name.strip()
+        if not name_update or len(name_update) > _MAX_PROJECT_NAME_LEN:
+            return JSONResponse(
+                {"error": f"name must be non-empty and at most {_MAX_PROJECT_NAME_LEN} characters."},
+                status_code=422,
+            )
+    if req.status is not None and req.status not in _VALID_PROJECT_STATUSES:
+        return JSONResponse(
+            {"error": f"status must be one of {sorted(_VALID_PROJECT_STATUSES)}."}, status_code=422,
+        )
+    if req.description and len(req.description) > _MAX_PROJECT_DESCRIPTION_LEN:
+        return JSONResponse(
+            {"error": f"description must be at most {_MAX_PROJECT_DESCRIPTION_LEN} characters."},
+            status_code=422,
+        )
+    for field_name, value in (("institutions", req.institutions), ("partners", req.partners)):
+        error = _validate_project_list_field(value, field_name)
+        if error:
+            return JSONResponse({"error": error}, status_code=422)
+
+    projects_path = Path(settings.paths.data_dir) / "projects.md"
+    updates = {
+        "name": name_update, "institutions": req.institutions, "partners": req.partners,
+        "status": req.status, "description": req.description,
+    }
+    token = mint_capability_token()
+    try:
+        project = await asyncio.to_thread(
+            update_project,
+            token, project_id, updates, projects_path,
+            settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
+        )
+    except KeyError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    return JSONResponse(_project_to_dict(project))
+
+
+@app.delete("/api/projects/{project_id}")
+async def delete_project(project_id: str):
+    """Soft delete: marks status="archived" and keeps the record in
+    projects.md for history/audit, same convention as DELETE /api/tasks/{id}
+    -- existing tasks' project_id references must never dangle."""
+    from cli.capability import mint_capability_token
+    from cli.project_apply import update_project
+
+    projects_path = Path(settings.paths.data_dir) / "projects.md"
+    token = mint_capability_token()
+    try:
+        await asyncio.to_thread(
+            update_project,
+            token, project_id, {"status": "archived"}, projects_path,
+            settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
+        )
+    except KeyError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    return JSONResponse({"project_id": project_id, "status": "archived"})
+
+
+@app.get("/api/projects/{project_id}/tasks")
+async def get_project_tasks(project_id: str):
+    """Read-only per-project task drill-down for the Projects tab (P2.6) --
+    a small server-side convenience over client-side filtering of the full
+    task list, so the Projects tab doesn't need to fetch and hold every task
+    in the browser just to show one project's slice."""
+    from mcp_server.todo import parse_todo
+
+    todo_path = Path(settings.paths.data_dir) / "todo.md"
+    todo_file = await asyncio.to_thread(parse_todo, todo_path)
+    tasks = [
+        _task_to_detail_dict(item) for item in todo_file.items
+        if item.project_id == project_id and item.status != "deleted"
+    ]
+    return JSONResponse({"project_id": project_id, "tasks": tasks})

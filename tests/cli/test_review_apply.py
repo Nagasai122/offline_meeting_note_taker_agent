@@ -132,6 +132,32 @@ def test_apply_happy_path_writes_todo_and_transitions_to_applied(tmp_path):
     assert load_session_state(dirs["state_dir"], "s1").state == State.APPLIED
 
 
+def test_apply_carries_ownership_fields_through_to_applied_todo_item(tmp_path):
+    """P2.5: owner_type/project_id/institution/confidence set during review
+    (whether from extraction or a human override) must survive onto the
+    applied TodoItem, not just description/owner/due_date/priority."""
+    dirs = _dirs(tmp_path)
+    create_session(dirs["state_dir"], "s1", dirs["lock_path"], 1.0, initial_state=State.REVIEWED)
+    _reviewed(dirs, "s1", [
+        ReviewDecision(
+            id="a", decision="accept", description="Do X", owner="Naga", due_date=None, session_id="s1",
+            owner_type="institution", project_id="proj-42", institution="UREAD", confidence=0.75,
+        ),
+    ])
+    token = mint_capability_token()
+
+    apply_reviewed_update(
+        token, "s1", dirs["pending_review_dir"], dirs["todo_path"], dirs["data_dir"],
+        dirs["state_dir"], dirs["lock_path"], 1.0,
+    )
+
+    todo = parse_todo(dirs["todo_path"])
+    assert todo.items[0].owner_type == "institution"
+    assert todo.items[0].project_id == "proj-42"
+    assert todo.items[0].institution == "UREAD"
+    assert todo.items[0].confidence == 0.75
+
+
 def test_apply_rejects_a_forged_token_and_makes_no_changes(tmp_path):
     dirs = _dirs(tmp_path)
     create_session(dirs["state_dir"], "s1", dirs["lock_path"], 1.0, initial_state=State.REVIEWED)

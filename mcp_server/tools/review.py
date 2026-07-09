@@ -69,6 +69,22 @@ def propose_todo_update(
         # legacy drafts and prompts without it stay byte-identical.
         if item.get("evidence"):
             meta["evidence"] = item["evidence"]
+        # P2.5: carry the extraction pipeline's ownership classification
+        # through to the draft so the review step (cli/review_apply.py) can
+        # surface it to a human reviewer -- same conditional-include pattern
+        # as evidence above. owner_type/confidence are always present on a
+        # normalized action item (mcp_server/tools/extraction.py's
+        # _normalize_action_item_ownership defaults them to "unknown"/None
+        # rather than omitting the keys), so they're included unconditionally
+        # here; project_id/institution are genuinely optional.
+        if item.get("owner_type"):
+            meta["owner_type"] = item["owner_type"]
+        if item.get("confidence") is not None:
+            meta["confidence"] = item["confidence"]
+        if item.get("project_id"):
+            meta["project_id"] = item["project_id"]
+        if item.get("institution"):
+            meta["institution"] = item["institution"]
         lines.append(f"- [ ] {item['description']} <!-- meta: {json.dumps(meta)} -->")
 
     pending_review_path = Path(pending_review_dir) / f"{session_id}.md"

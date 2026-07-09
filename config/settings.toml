@@ -42,3 +42,12 @@ trace_dir = "data/traces"         # JSONL audit trail, one file per run
 # dashboard Export button. Empty = disabled; set to your vault's root, e.g.
 # vault_dir = "C:/Users/you/Documents/ObsidianVault"
 vault_dir = ""
+
+[identity]
+# Who "self" means for ownership classification (P2) -- lets the extraction
+# pipeline tell your own action items apart from ones owned by your
+# institution, a partner, or someone else. Empty name = not configured;
+# ownership classification then falls back to "unknown" instead of guessing.
+name = ""                 # e.g. "Naga Sai"
+aliases = []               # other names/initials you're referred to by in meetings, e.g. ["Naga", "N. Sai"]
+institution = ""          # e.g. "UREAD"

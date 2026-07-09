@@ -48,6 +48,17 @@ the trusted CLI surface:
      token to call `add_task_attachment()`, same append-only pattern as
      comments above; the endpoint itself saves the file to
      data/task_attachments/<task_id>/ before recording the reference.
+  11. cli/web.py `POST /api/projects` endpoint — mints a token to call
+     `create_project()` (cli/project_apply.py, P2.2). Creating a Project
+     record is always a human action via this endpoint; the extraction
+     pipeline (mcp_server/tools/extraction.py) may only match an item
+     against the existing list via the read-only `parse_projects()`, never
+     mint a token or create one itself.
+  12. cli/web.py `PATCH /api/projects/{project_id}` endpoint — mints a token
+     to call `update_project()`.
+  13. cli/web.py `DELETE /api/projects/{project_id}` endpoint — mints a token
+     to call `update_project()` with a status="archived" soft delete, same
+     convention as call site 6's task soft delete.
 Grep for `mint_capability_token()` call sites is itself a verification step
 (docs/architecture.md should list this as part of the M6 verification
 checklist); this docstring must be kept current whenever a new call site is

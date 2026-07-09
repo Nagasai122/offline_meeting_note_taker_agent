@@ -5,6 +5,7 @@ import json
 import pytest
 
 from mcp_server.state import State, create_session, load_session_state
+from mcp_server.todo import parse_todo
 from mcp_server.tools.review import get_session_status, get_transcript, list_sessions, propose_todo_update
 
 
@@ -34,6 +35,49 @@ def test_propose_todo_update_writes_draft_and_transitions(tmp_path):
     assert "Send the report" in draft
     assert not todo_path.exists()  # draft-only: todo.md itself must never be touched here
     assert load_session_state(state_dir, "s1").state == State.PROPOSED
+
+
+def test_propose_todo_update_carries_ownership_fields_into_draft(tmp_path):
+    """P2.5: owner_type/confidence/project_id/institution from an already-
+    normalized action item (mcp_server/tools/extraction.py) must survive
+    into the draft's meta -- the draft is itself valid todo.md-format
+    Markdown (parse_todo can read it back), so this is really a round-trip
+    check through the same parser the review step later uses."""
+    meetings_dir, todo_path, pending_review_dir, state_dir, lock_path = _dirs(tmp_path)
+    meetings_dir.mkdir()
+    (meetings_dir / "s1.actions.json").write_text(json.dumps([
+        {
+            "description": "Send the report", "owner": "Naga", "owner_type": "self",
+            "confidence": 0.92, "project_id": "proj-42", "institution": "UREAD",
+        },
+    ]))
+    create_session(state_dir, "s1", lock_path, 1.0, initial_state=State.EXTRACTED)
+
+    propose_todo_update("s1", meetings_dir, todo_path, pending_review_dir, state_dir, lock_path, 1.0)
+
+    draft_items = parse_todo(pending_review_dir / "s1.md").items
+    assert draft_items[0].owner_type == "self"
+    assert draft_items[0].confidence == 0.92
+    assert draft_items[0].project_id == "proj-42"
+    assert draft_items[0].institution == "UREAD"
+
+
+def test_propose_todo_update_omits_absent_ownership_fields(tmp_path):
+    """Conditional-include: an action item with no ownership classification
+    (owner_type/confidence absent, e.g. hand-built JSON predating P2) must
+    not clutter the draft with null fields."""
+    meetings_dir, todo_path, pending_review_dir, state_dir, lock_path = _dirs(tmp_path)
+    meetings_dir.mkdir()
+    (meetings_dir / "s1.actions.json").write_text(json.dumps([{"description": "Plain item"}]))
+    create_session(state_dir, "s1", lock_path, 1.0, initial_state=State.EXTRACTED)
+
+    propose_todo_update("s1", meetings_dir, todo_path, pending_review_dir, state_dir, lock_path, 1.0)
+
+    draft_text = (pending_review_dir / "s1.md").read_text()
+    assert "owner_type" not in draft_text
+    assert "project_id" not in draft_text
+    assert "institution" not in draft_text
+    assert "confidence" not in draft_text
 
 
 def test_propose_todo_update_with_malformed_existing_todo_fails_loudly(tmp_path):

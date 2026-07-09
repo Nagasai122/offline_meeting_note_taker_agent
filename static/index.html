@@ -26,6 +26,7 @@
                 <li id="nav-calendar" data-tab="calendar" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('calendar')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('calendar');}"><i class="fa-solid fa-calendar-days"></i> Calendar</li>
                 <li id="nav-meetings" data-tab="meetings" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('meetings')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('meetings');}"><i class="fa-solid fa-folder-open"></i> Past Meetings</li>
                 <li id="nav-tasks" data-tab="tasks" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('tasks')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('tasks');}"><i class="fa-solid fa-list-check"></i> Tasks</li>
+                <li id="nav-projects" data-tab="projects" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('projects')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('projects');}"><i class="fa-solid fa-diagram-project"></i> Projects</li>
                 <li id="nav-review" data-tab="review" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('review')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('review');}"><i class="fa-solid fa-user-check"></i> Needs Review <span id="review-badge" class="badge" style="display:none;background:#b8862e;"></span></li>
                 <li id="nav-settings" data-tab="settings" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('settings')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('settings');}"><i class="fa-solid fa-gear"></i> Settings</li>
                 <li id="nav-system" data-tab="system" role="tab" tabindex="0" aria-selected="false" onclick="switchTab('system')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('system');}"><i class="fa-solid fa-sliders"></i> System</li>
@@ -456,8 +457,62 @@
                         <button class="filter-btn" data-filter="blocked" role="tab" aria-selected="false" onclick="setTaskFilter('blocked')">Blocked</button>
                         <button class="filter-btn" data-filter="done" role="tab" aria-selected="false" onclick="setTaskFilter('done')">Done</button>
                     </div>
+                    <!-- P2.6: ownership + date-based cross-project views, alongside the
+                         status filters above. See app.js's _filterTasks for the
+                         owner_type -> bucket mapping this relies on. -->
+                    <div class="filter-bar" role="tablist" aria-label="Filter tasks by ownership or date" style="margin-top:-0.5rem;">
+                        <button class="filter-btn" data-filter="mine" role="tab" aria-selected="false" onclick="setTaskFilter('mine')">My Tasks</button>
+                        <button class="filter-btn" data-filter="institution" role="tab" aria-selected="false" onclick="setTaskFilter('institution')">Institution</button>
+                        <button class="filter-btn" data-filter="partner" role="tab" aria-selected="false" onclick="setTaskFilter('partner')">Partner</button>
+                        <button class="filter-btn" data-filter="overdue" role="tab" aria-selected="false" onclick="setTaskFilter('overdue')">Overdue</button>
+                        <button class="filter-btn" data-filter="upcoming" role="tab" aria-selected="false" onclick="setTaskFilter('upcoming')">Upcoming (7d)</button>
+                    </div>
 
                     <div class="widget-body" id="full-task-list">
+                        <!-- Populated by JS -->
+                        <div class="loading-shimmer"></div>
+                    </div>
+                </section>
+            </div>
+
+            <div id="view-projects" class="hidden">
+                <section class="card glass-panel">
+                    <div class="card-header">
+                        <h2><i class="fa-solid fa-diagram-project" style="color: var(--primary);"></i> Projects</h2>
+                        <span class="badge" id="projects-count">0</span>
+                    </div>
+
+                    <button id="btn-toggle-add-project" class="btn-secondary" style="margin-bottom: 1rem;" onclick="toggleAddProjectForm()">
+                        <i class="fa-solid fa-plus"></i> New Project
+                    </button>
+
+                    <div id="add-project-form" class="hidden glass-panel" style="padding: 1.25rem; margin-bottom: 1.25rem;">
+                        <div class="form-row">
+                            <label class="field-label" for="new-project-name">Name</label>
+                            <input type="text" id="new-project-name" class="text-input" maxlength="200" placeholder="e.g. CyberSec Consortium" oninput="_validateAddProjectForm()">
+                        </div>
+                        <div style="display:flex; gap:1rem; flex-wrap:wrap;">
+                            <div class="form-row" style="flex:1; min-width:180px;">
+                                <label class="field-label" for="new-project-institutions">Institutions (comma-separated)</label>
+                                <input type="text" id="new-project-institutions" class="text-input" placeholder="e.g. UREAD">
+                            </div>
+                            <div class="form-row" style="flex:1; min-width:180px;">
+                                <label class="field-label" for="new-project-partners">Partners (comma-separated)</label>
+                                <input type="text" id="new-project-partners" class="text-input" placeholder="e.g. Marmara University">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <label class="field-label" for="new-project-description">Description (optional)</label>
+                            <textarea id="new-project-description" class="textarea-input" rows="2" maxlength="1000"></textarea>
+                        </div>
+                        <div id="add-project-error" style="color:#a6432d; font-size:0.85rem; margin-bottom:0.5rem;"></div>
+                        <div class="form-actions">
+                            <button id="btn-save-project" class="btn-primary" disabled onclick="saveNewProject()">Save Project</button>
+                            <button class="btn-secondary" onclick="toggleAddProjectForm(false)">Cancel</button>
+                        </div>
+                    </div>
+
+                    <div class="widget-body" id="projects-list">
                         <!-- Populated by JS -->
                         <div class="loading-shimmer"></div>
                     </div>

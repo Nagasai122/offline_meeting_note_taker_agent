@@ -30,6 +30,7 @@ from mcp.server.fastmcp import FastMCP
 
 from config.loader import Settings, load_settings
 from llm.client import HttpLLMClient
+from mcp_server.project import parse_projects
 from mcp_server.tools.extraction import extract_action_items as _extract_action_items
 from mcp_server.tools.recording import start_meeting as _start_meeting
 from mcp_server.tools.recording import stop_meeting as _stop_meeting
@@ -47,6 +48,7 @@ def build_server(settings: Settings) -> FastMCP:
     state_dir = Path(paths.data_dir) / "state"
     meetings_dir = Path(paths.data_dir) / "meetings"
     todo_path = Path(paths.data_dir) / "todo.md"
+    projects_path = Path(paths.data_dir) / "projects.md"
     pending_review_dir = Path(paths.data_dir) / "pending_review"
     tmp_dir = Path(paths.tmp_dir)
     lock_path = settings.concurrency.lock_path
@@ -76,7 +78,16 @@ def build_server(settings: Settings) -> FastMCP:
     @mcp.tool()
     def extract_action_items(session_id: str) -> dict:
         """Ask the local LLM for action items from a transcript (TRANSCRIBED -> EXTRACTED)."""
-        return _extract_action_items(session_id, meetings_dir, state_dir, lock_path, lock_timeout, llm_client)
+        # P2: identity/active-projects context for owner_type/project_id
+        # classification. Read-only -- parse_projects() has no write
+        # capability, matching the "extraction can match, never silently
+        # create" invariant (a new Project always requires a human action
+        # via cli/project_apply.py, never imported here).
+        active_projects = parse_projects(projects_path).projects
+        return _extract_action_items(
+            session_id, meetings_dir, state_dir, lock_path, lock_timeout, llm_client,
+            identity=settings.identity, active_projects=active_projects,
+        )
 
     @mcp.tool()
     def propose_todo_update(session_id: str) -> dict:
