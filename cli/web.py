@@ -140,6 +140,16 @@ recording_processes = []
 active_session_id = None
 processing = False
 pipeline_stage: str | None = None   # None | "RECORDING" | "TRANSCRIBING" | "LLM_LOADING" | "EXTRACTING" | "AWAITING_REVIEW" | "ERROR"
+# The session_id `processing` currently refers to, if any. Unlike
+# active_session_id (which is cleared the moment recording *stops*, well
+# before run_pipeline finishes transcribing/extracting -- see stop_recording
+# below), this stays set for the full lifetime of whichever background
+# pipeline coroutine (run_pipeline / run_extraction_only) is in flight, so the
+# stalled-session detector (GET /api/sessions/stalled) can reliably tell "this
+# session is mid-pipeline" apart from "this session is genuinely stuck" even
+# when the pipeline was entered via /api/sessions/{id}/resume rather than a
+# live recording.
+_processing_session_id: str | None = None
 live_transcript = ""
 pipeline_error = None
 
@@ -474,10 +484,11 @@ async def _start_recording_locked(req: StartRecordRequest | None) -> dict:
         from mcp_server.meeting_type import write_meeting_type
         write_meeting_type(meetings_dir, active_session_id, req.meeting_type)
 
-    # Save context if provided
+    # Save context if provided (atomically: a crash mid-write must not leave a
+    # truncated context file for the pipeline to ingest -- see concurrency/atomic.py)
     if req and req.context:
         context_path = meetings_dir / f"{active_session_id}.context.txt"
-        context_path.write_text(req.context, encoding="utf-8")
+        atomic_write_text(context_path, req.context)
 
     _active_whisper_model = req.whisper_model if req else None
 
@@ -750,21 +761,17 @@ async def fetch_mail_context_endpoint(req: MailContextRequest):
 @app.post("/api/context/mail-file")
 async def upload_mail_file(file: UploadFile = File(...), session_id: str | None = Form(None)):
     """Deterministic email context: parse a dragged-and-dropped .eml/.msg file
-    (cli/mail_import.py) instead of fuzzy-matching the Outlook inbox. Same
-    session_id semantics as /api/context/mail: without one, the parsed text is
-    returned for the pre-meeting modal to fold into the agenda notes; with
-    one, it persists as `<session_id>.mail_context.txt`."""
-    from cli.mail_import import (
-        SUPPORTED_MAIL_SUFFIXES, MailParseError, format_mail_context, parse_mail_file,
-    )
+    (cli/mail_import.py) instead of fuzzy-matching the Outlook inbox. Files
+    with an unknown or missing extension are accepted too: parse_mail_file
+    content-sniffs them (OLE magic -> .msg, RFC-822 headers -> .eml) and
+    raises MailParseError (-> 400) if the bytes are neither. Same session_id
+    semantics as /api/context/mail: without one, the parsed text is returned
+    for the pre-meeting modal to fold into the agenda notes; with one, it
+    persists as `<session_id>.mail_context.txt`."""
+    from cli.mail_import import MailParseError, format_mail_context, parse_mail_file
     from cli.mail_sync import save_mail_context
 
     suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in SUPPORTED_MAIL_SUFFIXES:
-        return JSONResponse(
-            {"error": f"Unsupported file type '{suffix}'. Allowed: {sorted(SUPPORTED_MAIL_SUFFIXES)}"},
-            status_code=400,
-        )
     if session_id is not None:
         from mcp_server.schemas import validate_session_id, SchemaValidationError
         try:
@@ -830,12 +837,63 @@ def _fail_session_best_effort(session_id: str, exc: Exception) -> None:
         logger.error("Could not transition session %s to FAILED: %s", session_id, state_exc)
 
 
+def _record_llm_unavailable_metadata(session_id: str, exc: Exception) -> None:
+    """Persist the LLM-unavailable reason into the session's own state-file
+    metadata (without transitioning it -- it must stay resumable), so the
+    reason survives a web-process restart or the next pipeline run resetting
+    the ephemeral `pipeline_error` global. Mirrors `_fail_session_best_effort`
+    in being best-effort and never raising: failing to *record* the reason
+    must not mask the original LLM-unavailable condition at the caller."""
+    from mcp_server.state import update_metadata
+
+    state_dir = Path(settings.paths.data_dir) / "state"
+    try:
+        update_metadata(
+            state_dir, session_id,
+            settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
+            last_error=str(exc), last_error_type=type(exc).__name__,
+        )
+    except Exception as meta_exc:  # noqa: BLE001 - see docstring
+        logger.error("Could not record LLM-unavailable metadata for %s: %s", session_id, meta_exc)
+
+
+class LlmUnavailableError(RuntimeError):
+    """Raised when the local LLM server never becomes healthy (cold-load
+    timeout, crash before serving, or no weights configured).
+
+    Deliberately a distinct type from the generic `Exception` every other
+    pipeline failure raises: the except blocks in run_pipeline and
+    run_extraction_only key off this type to skip _fail_session_best_effort.
+    An LLM being unreachable is transient local infrastructure trouble, not
+    evidence anything is wrong with the session itself -- the transcript (and,
+    for run_extraction_only, the extracted items) are already durably on disk,
+    so forcing the session to terminal FAILED here would need a brand new
+    session_id to retry, discarding a completed step for no reason. Instead
+    the session is left at its current state (TRANSCRIBED or EXTRACTED,
+    whichever it already reached) so it can be resumed -- see
+    GET /api/sessions/stalled + POST /api/sessions/{id}/resume, or the
+    `meeting-agent agent-run --session-id <id>` CLI escape hatch -- once the
+    LLM server is confirmed healthy."""
+
+
 async def run_extraction_only(session_id: str) -> None:
-    """Run agent-run for a session already at TRANSCRIBED (import-transcript's
-    web counterpart -- no process/transcribe step, since there is no audio).
-    Mirrors run_pipeline's LLM-readiness + agent-run steps only."""
-    global processing, pipeline_error
+    """Run agent-run for a session already at TRANSCRIBED or EXTRACTED
+    (import-transcript's web counterpart -- no process/transcribe step, since
+    there is no audio). Mirrors run_pipeline's LLM-readiness + agent-run steps
+    only.
+
+    Generic across both starting states on purpose: `agent-run` (agent/loop.py)
+    is itself entirely state-driven -- its mandatory first tool call is
+    get_session_status, and agent/prompts/system_prompt.md's dispatch table
+    tells it to call extract_action_items from TRANSCRIBED but
+    propose_todo_update directly from EXTRACTED. This function only has to
+    launch the same subprocess either way; which step actually runs is decided
+    inside that subprocess, not here. This is also why
+    POST /api/sessions/{id}/resume reuses this same function for both
+    TRANSCRIBED and EXTRACTED sessions rather than needing a second one."""
+    global processing, pipeline_error, pipeline_stage, _processing_session_id
     pipeline_error = None
+    _processing_session_id = session_id
     llm_port = settings.llm.port
     llm_already_running = False
     try:
@@ -852,12 +910,27 @@ async def run_extraction_only(session_id: str) -> None:
         serve_proc, serve_log = _spawn_serve_subprocess_with_log()
 
     try:
-        await _wait_for_llm_ready(settings.llm.startup_timeout_seconds, serve_proc, serve_log)
+        try:
+            await _wait_for_llm_ready(settings.llm.startup_timeout_seconds, serve_proc, serve_log)
+        except (RuntimeError, TimeoutError) as exc:
+            raise LlmUnavailableError(
+                f"LLM server unavailable -- the transcript/extraction already on disk for "
+                f"'{session_id}' is safe. This session remains resumable: use the dashboard's "
+                f"Stalled -> Resume action, or run `meeting-agent agent-run --session-id "
+                f"{session_id}` once the LLM server is confirmed healthy. Underlying error: {exc}"
+            )
         logger.info("[%s] Running agent (import)...", session_id)
         code, out = await _run_subprocess([sys.executable, "-m", "cli.main", "agent-run", "--session-id", session_id])
         if code != 0:
             raise Exception(f"Agent processing failed: {out}")
         logger.info("[%s] Extraction complete -- items awaiting human review in data/pending_review/.", session_id)
+    except LlmUnavailableError as e:
+        # Deliberately no _fail_session_best_effort here -- see the class
+        # docstring. The session stays at whichever state it already reached.
+        pipeline_stage = "ERROR"
+        logger.warning("[%s] LLM unavailable during import pipeline (session left resumable): %s", session_id, e)
+        pipeline_error = str(e)
+        _record_llm_unavailable_metadata(session_id, e)
     except Exception as e:
         logger.error("[%s] Error in import pipeline: %s", session_id, e, exc_info=True)
         pipeline_error = str(e)
@@ -865,7 +938,15 @@ async def run_extraction_only(session_id: str) -> None:
     finally:
         if serve_proc is not None:
             await asyncio.to_thread(_terminate_and_wait, serve_proc, 10)
-        processing = False
+        # Only release the lock if it's still ours -- if a second pipeline for a
+        # different session has since acquired it (should no longer happen now
+        # that every entry point serializes through _run_pipeline_when_free /
+        # the busy-check below, but this keeps the finally itself correct even
+        # if that invariant is ever violated), clobbering `processing` here
+        # would falsely mark the other pipeline as no longer running.
+        if _processing_session_id == session_id:
+            processing = False
+            _processing_session_id = None
 
 
 @app.post("/api/upload/transcript")
@@ -886,9 +967,17 @@ async def upload_transcript(
     write for an auto-matched live recording. If the id doesn't resolve to a
     real event, this logs a warning and proceeds without a calendar link --
     it never fails the import over optional enrichment."""
+    global processing, _processing_session_id
     from mcp_server.meeting_type import MeetingType, write_meeting_type
     from mcp_server.schemas import validate_session_id, SchemaValidationError
     from mcp_server import state as state_mod
+
+    if processing:
+        return JSONResponse(
+            {"error": "A pipeline is already processing another session. "
+                      "Wait for it to finish before importing a new transcript."},
+            status_code=409,
+        )
 
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in _SUPPORTED_TRANSCRIPT_SUFFIXES:
@@ -988,8 +1077,8 @@ async def upload_transcript(
     finally:
         tmp_path.unlink(missing_ok=True)
 
-    global processing
     processing = True
+    _processing_session_id = session_id
     asyncio.create_task(run_extraction_only(session_id))
 
     return JSONResponse({"status": "importing", "session_id": session_id, "segments_count": len(segments)})
@@ -1216,9 +1305,28 @@ async def _run_subprocess(
     return proc.returncode, (stdout or b"").decode(errors="replace")
 
 
+async def _run_pipeline_when_free(session_id: str, auto_accept: bool, whisper_model: str | None) -> None:
+    """Wait for any in-flight pipeline to finish, then claim `processing` and
+    run `run_pipeline`. Used by /api/record/stop, which -- unlike a deliberate
+    action such as importing a transcript or resuming a stalled session --
+    cannot simply reject the request: the recording has already been stopped
+    and its audio is already safely on disk by the time this is scheduled, so
+    the only choice is to serialize the pipeline run rather than let it race
+    a still-running one for the shared `processing`/`_processing_session_id`
+    globals (see the resume/import 409 guards for the reject-fast half of
+    this same invariant)."""
+    global processing, _processing_session_id
+    while processing:
+        await asyncio.sleep(0.5)
+    processing = True
+    _processing_session_id = session_id
+    await run_pipeline(session_id, auto_accept=auto_accept, whisper_model=whisper_model)
+
+
 async def run_pipeline(session_id: str, auto_accept: bool = False, whisper_model: str | None = None):
-    global processing, pipeline_error, pipeline_stage
+    global processing, pipeline_error, pipeline_stage, _processing_session_id
     pipeline_error = None
+    _processing_session_id = session_id
     """Orchestrate serve -> process -> agent-run -> (optional) auto-apply -> shutdown serve"""
     # Check if an LLM server is already listening on the configured port.
     # If so, reuse it (and don't shut it down when we're done -- we didn't start it).
@@ -1294,11 +1402,12 @@ async def run_pipeline(session_id: str, auto_accept: bool = False, whisper_model
         try:
             await _wait_for_llm_ready(settings.llm.startup_timeout_seconds, serve_proc, serve_log)
         except (RuntimeError, TimeoutError) as exc:
-            raise Exception(
-                f"LLM server unavailable — transcription saved at "
-                f"data/meetings/{session_id}.md. You can retry extraction later with: "
-                f"meeting-agent agent-run --session-id {session_id} "
-                f"(once the LLM server is confirmed healthy). Underlying error: {exc}"
+            raise LlmUnavailableError(
+                f"LLM server unavailable -- transcription is saved at "
+                f"data/meetings/{session_id}.md. This session remains resumable: use the "
+                f"dashboard's Stalled -> Resume action, or run `meeting-agent agent-run "
+                f"--session-id {session_id}` once the LLM server is confirmed healthy. "
+                f"Underlying error: {exc}"
             )
 
         # 4. Agent Run — Fix 1.3: signal that transcription is already done so
@@ -1370,6 +1479,16 @@ async def run_pipeline(session_id: str, auto_accept: bool = False, whisper_model
         else:
             pipeline_stage = "AWAITING_REVIEW"
             logger.info("[%s] Extraction complete -- items awaiting human review in data/pending_review/.", session_id)
+    except LlmUnavailableError as e:
+        # Deliberately no _fail_session_best_effort here -- see the class
+        # docstring above run_extraction_only. Transcription already
+        # succeeded and is durably on disk; the session stays at TRANSCRIBED
+        # so the retry hint in the message above is actually true (FAILED has
+        # no outgoing edges in mcp_server.state.ALLOWED_TRANSITIONS).
+        pipeline_stage = "ERROR"
+        logger.warning("[%s] LLM unavailable (session left resumable at its current state): %s", session_id, e)
+        pipeline_error = str(e)
+        _record_llm_unavailable_metadata(session_id, e)
     except Exception as e:
         pipeline_stage = "ERROR"
         logger.error("[%s] Error in pipeline: %s", session_id, e, exc_info=True)
@@ -1390,10 +1509,131 @@ async def run_pipeline(session_id: str, auto_accept: bool = False, whisper_model
         if active_session_id == session_id:
             active_session_id = None
             recording_processes = []
-        processing = False
+        # Only release the lock if it's still ours -- see the matching comment
+        # in run_extraction_only's finally block for why `processing` must not
+        # be cleared unconditionally here.
+        if _processing_session_id == session_id:
+            processing = False
+            _processing_session_id = None
         if pipeline_stage not in ("AWAITING_REVIEW", "ERROR"):
             pipeline_stage = None
         logger.info("[%s] Pipeline complete.", session_id)
+
+
+# ── Stalled sessions + resume ─────────────────────────────────────────────────
+# A session can be parked at STOPPED/TRANSCRIBED/EXTRACTED indefinitely if the
+# pipeline that was driving it dies or is never (re)started -- most commonly
+# an LlmUnavailableError above, but also a dashboard restart mid-pipeline or a
+# crashed subprocess. None of these three states shows up anywhere else in the
+# dashboard today: /api/review/pending only surfaces PROPOSED/REVIEWED (which
+# are correctly awaiting a human, not "stalled"), and the Recent Notes /
+# Past Meetings lists are keyed off *.summary.md, which does not exist until
+# extraction has actually run. A dedicated endpoint is therefore cleaner than
+# bolting a `stalled` flag onto an existing response shape that was never
+# designed to enumerate this set of states.
+
+def _stalled_candidate_states():
+    from mcp_server.state import State
+    return {State.STOPPED, State.TRANSCRIBED, State.EXTRACTED}
+
+
+def _scan_stalled_sessions(state_dir: Path, exclude_session_id: str | None) -> list[dict]:
+    """Synchronous scan (glob + open + json-parse per session state file) --
+    kept as a plain function so the endpoint below can offload it via
+    asyncio.to_thread rather than blocking the event loop, since it's polled
+    from the dashboard every few seconds and grows with total session count."""
+    from mcp_server.state import list_session_ids, load_session_state
+
+    stalled_states = _stalled_candidate_states()
+    result = []
+    for session_id in list_session_ids(state_dir):
+        if session_id == exclude_session_id:
+            continue  # a pipeline is actively driving this one right now
+        try:
+            session = load_session_state(state_dir, session_id)
+        except (FileNotFoundError, ValueError, KeyError):
+            continue  # corrupted state file -- not this endpoint's job to report
+        if session.state not in stalled_states:
+            continue
+        last_at = session.history[-1].get("at") if session.history else None
+        result.append({
+            "session_id": session_id,
+            "state": session.state.value,
+            "last_updated": last_at,
+            "stalled": True,
+        })
+    result.sort(key=lambda r: r["session_id"])
+    return result
+
+
+@app.get("/api/sessions/stalled")
+async def get_stalled_sessions():
+    """Sessions at STOPPED/TRANSCRIBED/EXTRACTED with no pipeline currently
+    driving them forward. PROPOSED/REVIEWED are excluded (already surfaced by
+    /api/review/pending as awaiting human review/apply); FAILED/APPLIED are
+    excluded (terminal -- FAILED needs a fresh session_id, APPLIED is done)."""
+    state_dir = Path(settings.paths.data_dir) / "state"
+    result = await asyncio.to_thread(_scan_stalled_sessions, state_dir, _processing_session_id)
+    return JSONResponse({"stalled": result})
+
+
+@app.post("/api/sessions/{session_id}/resume")
+async def resume_session(session_id: str):
+    """Resume a stalled session from wherever it is parked, without ever
+    touching data/todo.md (no auto_accept -- this only ever drives a session
+    as far as PROPOSED; the review/apply human gate is untouched).
+
+    - TRANSCRIBED and EXTRACTED both resume via run_extraction_only, which
+      just launches `agent-run` -- itself entirely state-driven (see
+      run_extraction_only's docstring), so the same call correctly does
+      extract_action_items+propose_todo_update from TRANSCRIBED or just
+      propose_todo_update from EXTRACTED.
+    - STOPPED resumes via run_pipeline itself (auto_accept=False), the same
+      function a live recording's /api/record/stop schedules -- it re-enters
+      at the transcription step and continues from there. No pipeline body is
+      duplicated for either case.
+    """
+    from mcp_server.schemas import validate_session_id, SchemaValidationError
+    from mcp_server.state import State, load_session_state
+
+    try:
+        validate_session_id(session_id)
+    except SchemaValidationError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+
+    state_dir = Path(settings.paths.data_dir) / "state"
+    try:
+        session = load_session_state(state_dir, session_id)
+    except FileNotFoundError:
+        return JSONResponse({"error": f"Unknown session '{session_id}'."}, status_code=404)
+
+    global processing, _processing_session_id
+    if processing:
+        return JSONResponse(
+            {"error": "A pipeline is already processing another session. "
+                      "Wait for it to finish before resuming this one."},
+            status_code=409,
+        )
+
+    if session.state in (State.TRANSCRIBED, State.EXTRACTED):
+        processing = True
+        _processing_session_id = session_id
+        asyncio.create_task(run_extraction_only(session_id))
+        return JSONResponse({"status": "resumed", "session_id": session_id, "from_state": session.state.value})
+
+    if session.state == State.STOPPED:
+        processing = True
+        _processing_session_id = session_id
+        asyncio.create_task(run_pipeline(session_id, auto_accept=False, whisper_model=None))
+        return JSONResponse({"status": "resumed", "session_id": session_id, "from_state": "STOPPED"})
+
+    return JSONResponse(
+        {"error": f"Session '{session_id}' is in state {session.state.value}; nothing to resume. "
+                  "Only STOPPED/TRANSCRIBED/EXTRACTED sessions can be resumed -- PROPOSED/REVIEWED "
+                  "are already awaiting human action in the Review tab, and FAILED/APPLIED are terminal."},
+        status_code=409,
+    )
+
 
 # ── Review / Apply endpoints ──────────────────────────────────────────────────
 # All three live in cli/ (the trusted surface), never in agent/ or mcp_server/.
@@ -1792,18 +2032,17 @@ async def search_meetings_endpoint(q: str = ""):
 async def post_search_reindex():
     """(Re)build the local semantic index over reviewed sessions. Explicitly
     user-triggered (embedding a large history takes seconds-to-minutes on
-    CPU); the index file is derived data under data/, safe to delete."""
-    from cli.semantic_search import refresh_index
+    CPU); the index file is derived data under data/, safe to delete.
+    Path derivation and the failure hint are shared with the CLI `reindex`
+    command via cli.semantic_search.index_paths/INDEX_UNAVAILABLE_HINT."""
+    from cli.semantic_search import INDEX_UNAVAILABLE_HINT, index_paths, refresh_index
 
-    meetings_dir = Path(settings.paths.data_dir) / "meetings"
-    state_dir = Path(settings.paths.data_dir) / "state"
-    db_path = Path(settings.paths.data_dir) / "semantic_index.db"
+    meetings_dir, state_dir, db_path = index_paths(settings.paths.data_dir)
     try:
         stats = await asyncio.to_thread(refresh_index, meetings_dir, state_dir, db_path)
     except Exception as exc:  # noqa: BLE001 - surfaced to the caller, not a 500
         return JSONResponse(
-            {"error": f"Semantic indexing unavailable: {exc}. "
-                      "Run `meeting-agent setup` to fetch the embedding model."},
+            {"error": f"Semantic indexing unavailable: {exc}. {INDEX_UNAVAILABLE_HINT}"},
             status_code=503,
         )
     return JSONResponse({"status": "indexed", **stats})

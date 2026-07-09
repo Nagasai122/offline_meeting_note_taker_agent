@@ -33,6 +33,7 @@ above — listed here for awareness, not as extra steps):
 | Document context (PDF/PPTX/DOCX upload) | `pdfplumber`, `python-pptx`, `python-docx` | Pure Python, no network at runtime. |
 | Spreadsheet context (.xlsx upload) | `openpyxl` | Pure Python, no network at runtime. |
 | Screenshot/image context (OCR) | `pytesseract`, `Pillow` | `pytesseract` is a thin wrapper around the separate **Tesseract OCR** binary, which is NOT installed by `pip`. Download the Windows installer from the [UB-Mannheim Tesseract build](https://github.com/UB-Mannheim/tesseract/wiki) and ensure `tesseract.exe` is on your `PATH` (or set `pytesseract.pytesseract.tesseract_cmd` to its install location) — otherwise image uploads fail with a clear "OCR unavailable" error rather than a silent no-op. Fully local; no cloud OCR API is ever involved. |
+| Email context (drag-and-drop .eml/.msg upload) | `extract-msg` | Core dependency (parses classic-Outlook `.msg` OLE files); `.eml` uses only the stdlib `email` module. |
 | Transcript/document upload endpoints | `python-multipart` | Required by FastAPI for multipart form uploads. |
 | Past Meetings / Project Meetings / Seminars search | `rank-bm25` | Pure Python. |
 | Local due-task reminders | `winotify` | Windows only; `cli/reminders.py` degrades to a no-op (logged warning) if not installed. |

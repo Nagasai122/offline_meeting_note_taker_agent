@@ -7,8 +7,10 @@ Why this exists: the COM matcher is best-effort and opaque (subject-token
 overlap in a ±24h window) — useful when it hits, baffling when it doesn't.
 Dropping the actual email is explicit and always right. "New" Outlook and
 most desktop clients drag messages out as real .eml files; classic Outlook
-drags produce .msg (OLE compound) files, parsed here via the optional
-`extract-msg` dependency.
+drags produce .msg (OLE compound) files, parsed here via the `extract-msg`
+dependency (a core install requirement). Files with an unknown or missing
+extension are content-sniffed (OLE magic → .msg, RFC-822 headers → .eml)
+before being rejected.
 
 Zero-egress: pure local file parsing (stdlib `email` for RFC-822 .eml;
 extract-msg reads the OLE container locally). No network, no COM.
@@ -23,8 +25,6 @@ from pathlib import Path
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _MAX_BODY_CHARS = 4000
-
-SUPPORTED_MAIL_SUFFIXES = {".eml", ".msg"}
 
 
 class MailParseError(ValueError):
@@ -114,13 +114,63 @@ def parse_msg_file(path: Path) -> dict:
     return parsed
 
 
+_OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+# The bare OLE/CFBF magic number above is shared by legacy .doc/.xls/.ppt/.msi
+# files, not just Outlook .msg -- "__substg1.0_" is the MAPI property-stream
+# name prefix that only appears inside a real .msg's compound-file directory,
+# so requiring it before committing to the "msg" classification is what keeps
+# a stray legacy Office file from being misrouted into extract-msg.
+_MSG_STREAM_MARKER = "__substg1.0_".encode("utf-16-le")
+
+# RFC-822 header lines near the top of the file are the .eml fingerprint.
+_RFC822_HEADER_RE = re.compile(
+    r"^(From|To|Subject|Received|MIME-Version|Date|Return-Path|Message-ID)\s*:",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _sniff_mail_kind(data: bytes) -> str | None:
+    """Guess whether raw bytes are a .msg (OLE compound) or .eml (RFC-822)
+    email, for files dropped without a recognisable extension. Returns
+    "msg", "eml", or None."""
+    if data.startswith(_OLE_MAGIC):
+        return "msg" if _MSG_STREAM_MARKER in data else None
+    head = data[:2048]
+    try:
+        text = head.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = head.decode("latin-1")
+        except UnicodeDecodeError:
+            return None
+        # latin-1 decodes anything; reject if it looks binary.
+        if "\x00" in text:
+            return None
+    if _RFC822_HEADER_RE.search(text):
+        return "eml"
+    return None
+
+
 def parse_mail_file(path: Path) -> dict:
     suffix = path.suffix.lower()
     if suffix == ".eml":
         return parse_eml_bytes(path.read_bytes())
     if suffix == ".msg":
         return parse_msg_file(path)
-    raise MailParseError(f"Unsupported mail file extension: {suffix!r} (allowed: .eml, .msg)")
+    # Unknown/missing extension: sniff the content so drag-and-drop sources
+    # that strip the extension (some mail clients, browser downloads) still
+    # work when the bytes are genuinely one of the supported formats.
+    data = path.read_bytes()
+    kind = _sniff_mail_kind(data)
+    if kind == "msg":
+        return parse_msg_file(path)
+    if kind == "eml":
+        return parse_eml_bytes(data)
+    raise MailParseError(
+        "Not a recognisable email file. Accepted: .eml, .msg "
+        "(or a file whose content is one of those)."
+    )
 
 
 def format_mail_context(parsed: dict) -> str:

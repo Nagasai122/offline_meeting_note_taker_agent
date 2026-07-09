@@ -359,7 +359,7 @@ meeting-agent process --session-id X --whisper-model large-v3
 
 ### 11.2 Web UI
 
-Dropdown in recording controls: **Fast (base)** | **Balanced (small)** | **Accurate (large-v3)**. Stored in session metadata. Default: from `settings.toml`.
+Dropdown in recording controls: **base** | **small** | **medium** | **large-v3** | **distil-large-v3** (the set accepted by the settings endpoint in `cli/web.py`). Stored in session metadata. Default: from `settings.toml` (`distil-large-v3`).
 
 ### 11.3 Trade-off
 

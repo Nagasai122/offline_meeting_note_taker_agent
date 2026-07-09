@@ -90,6 +90,21 @@ def _chunk_words(text: str) -> list[str]:
     ]
 
 
+# Shown by both the CLI `reindex` command and the dashboard's Settings ->
+# "Rebuild semantic index" button (POST /api/search/reindex) when refresh_index
+# fails -- kept as one constant so the two callers can't drift.
+INDEX_UNAVAILABLE_HINT = "Run `meeting-agent setup` to fetch the embedding model."
+
+
+def index_paths(data_dir: Path | str) -> tuple[Path, Path, Path]:
+    """The (meetings_dir, state_dir, db_path) triple `refresh_index` needs,
+    derived from `settings.paths.data_dir` -- shared by the CLI `reindex`
+    command and the web `/api/search/reindex` endpoint so the derivation
+    can't drift between the two callers."""
+    data_dir = Path(data_dir)
+    return data_dir / "meetings", data_dir / "state", data_dir / "semantic_index.db"
+
+
 def refresh_index(
     meetings_dir: Path | str,
     state_dir: Path | str,

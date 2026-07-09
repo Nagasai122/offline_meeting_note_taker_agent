@@ -11,9 +11,11 @@ dependencies = [
     "sounddevice>=0.4",
     "pyaudiowpatch>=0.2; sys_platform == 'win32'",
     "pywin32>=306; sys_platform == 'win32'",
-    "watchdog>=4.0",
     "mcp>=1.2",
     "fastapi>=0.100",
+    "typer>=0.12",
+    "pydantic>=2.0",
+    "extract-msg>=0.45",
     "uvicorn>=0.23",
     "nvidia-cublas-cu12; sys_platform == 'win32'",
     "nvidia-cudnn-cu12; sys_platform == 'win32'",
@@ -37,7 +39,6 @@ dependencies = [
 [project.optional-dependencies]
 diarisation = ["pyannote.audio>=3.3"]
 semantic-search = ["fastembed>=0.3", "sqlite-vec>=0.1.6"]
-mail-msg = ["extract-msg>=0.45"]
 app = ["pystray>=0.19"]
 dev = ["pytest>=8.0", "pytest-cov>=5.0", "hypothesis>=6.100"]
 

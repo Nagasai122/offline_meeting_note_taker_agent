@@ -94,6 +94,21 @@ def pipeline_status(state_dir: Path | str, today: date) -> dict:
     failed_today: list[str] = []
     applied_today: list[str] = []
     unreadable: list[str] = []
+    stalled: list[str] = []
+
+    # STOPPED/TRANSCRIBED/EXTRACTED are normally momentary (the web/CLI
+    # pipeline drives straight through them), but a session can now also be
+    # deliberately left parked at TRANSCRIBED/EXTRACTED by the LLM-readiness
+    # gate (cli/web.py's LlmUnavailableError) instead of being failed -- this
+    # is the CLI-only counterpart of the dashboard's Stalled/Resume feature
+    # (GET /api/sessions/stalled), so a CLI-only user's morning briefing
+    # doesn't go blind to a session an LLM outage left resumable. Unlike
+    # that endpoint, this has no way to know whether a concurrent `process`/
+    # `agent-run` command is live right now (no in-memory state to check from
+    # a separate process) -- a session genuinely mid-CLI-pipeline can
+    # transiently appear here too, same as awaiting_review/awaiting_apply
+    # are not checked against concurrent activity either.
+    _stalled_states = (state_mod.State.STOPPED, state_mod.State.TRANSCRIBED, state_mod.State.EXTRACTED)
 
     for session_id in state_mod.list_session_ids(state_dir):
         try:
@@ -107,6 +122,8 @@ def pipeline_status(state_dir: Path | str, today: date) -> dict:
             awaiting_review.append(session_id)
         elif session.state == state_mod.State.REVIEWED:
             awaiting_apply.append(session_id)
+        elif session.state in _stalled_states:
+            stalled.append(session_id)
         elif session.state in (state_mod.State.FAILED, state_mod.State.APPLIED):
             if not session.history:
                 continue
@@ -128,6 +145,7 @@ def pipeline_status(state_dir: Path | str, today: date) -> dict:
         "failed_today": sorted(failed_today),
         "applied_today": sorted(applied_today),
         "unreadable": sorted(unreadable),
+        "stalled": sorted(stalled),
     }
 
 
@@ -223,6 +241,11 @@ def render_briefing(briefing: dict) -> str:
     lines.append(f"  Awaiting apply (REVIEWED): {', '.join(sessions['awaiting_apply']) or 'none'}")
     lines.append(f"  Failed today -- needs attention: {', '.join(sessions['failed_today']) or 'none'}")
     lines.append(f"  Applied today: {', '.join(sessions['applied_today']) or 'none'}")
+    if sessions.get("stalled"):
+        lines.append(
+            f"  Stalled (STOPPED/TRANSCRIBED/EXTRACTED) -- resume via the "
+            f"dashboard or `meeting-agent agent-run`/`process`: {', '.join(sessions['stalled'])}"
+        )
     if sessions.get("unreadable"):
         lines.append(
             f"  Unreadable state files -- inspect by hand: {', '.join(sessions['unreadable'])}"

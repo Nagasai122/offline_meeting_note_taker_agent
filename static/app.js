@@ -1,11 +1,24 @@
 document.addEventListener('DOMContentLoaded', () => {
+    setGreeting();
     fetchBriefing();
     setInterval(fetchBriefing, 5000); // Poll every 5s for updates
-    
+
+    loadStalledSessions();
+    setInterval(loadStalledSessions, 5000); // Same cadence as fetchBriefing, kept separate on purpose
+
     document.getElementById('btn-toggle-record').addEventListener('click', toggleRecording);
     document.getElementById('btn-highlight').addEventListener('click', logHighlight);
     document.getElementById('btn-add-context').addEventListener('click', toggleAddContextPanel);
 });
+
+function setGreeting() {
+    const el = document.getElementById('greeting-text');
+    if (!el) return;
+    const hour = new Date().getHours();
+    el.textContent = hour < 12 ? 'Good morning.'
+                   : hour < 18 ? 'Good afternoon.'
+                   : 'Good evening.';
+}
 
 let isRecording = false;
 let _briefingFailureCount = 0;
@@ -298,9 +311,115 @@ function showFetchError(message) {
     console.error(message);
 }
 
+// ── Stalled sessions ─────────────────────────────────────────────────────────
+// A session parked at STOPPED/TRANSCRIBED/EXTRACTED (most often because the
+// local LLM server was unreachable) will never advance on its own. This polls
+// GET /api/sessions/stalled and renders a "Stalled" badge + Resume button for
+// each one -- see cli/web.py's resume_session for what each state does.
+
+async function loadStalledSessions() {
+    try {
+        const resp = await fetch('/api/sessions/stalled');
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        renderStalledSessions(data.stalled || []);
+    } catch (e) {
+        // Best-effort widget: a failure here must not raise the global error
+        // banner (that's reserved for /api/briefing per bugfix precedent) --
+        // just leave the banner in whatever state it was last in.
+        console.error('Failed to load stalled sessions:', e);
+    }
+}
+
+const STALLED_STATE_LABEL = {
+    STOPPED: 'Stopped — not yet transcribed',
+    TRANSCRIBED: 'Transcribed — extraction did not run',
+    EXTRACTED: 'Extracted — proposal was not written',
+};
+
+function renderStalledSessions(sessions) {
+    const banner = document.getElementById('stalled-sessions-banner');
+    const list = document.getElementById('stalled-sessions-list');
+    if (!banner || !list) return;
+
+    if (!sessions.length) {
+        banner.classList.add('hidden');
+        list.innerHTML = '';
+        return;
+    }
+
+    banner.classList.remove('hidden');
+    list.innerHTML = sessions.map(s => `
+        <div class="glass-panel" style="display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:0.75rem 1rem;background:var(--card-raised);">
+            <div style="flex:1;min-width:0;">
+                <span class="badge" style="background:#b8862e;margin-right:0.5rem;">Stalled</span>
+                <strong>${escHtml(s.session_id)}</strong>
+                <div style="font-size:0.8rem;color:var(--text-muted);margin-top:0.2rem;">
+                    ${escHtml(STALLED_STATE_LABEL[s.state] || s.state)}
+                </div>
+            </div>
+            <button class="btn-primary" style="padding:6px 14px;font-size:0.85rem;flex-shrink:0;"
+                    onclick="resumeStalledSession('${escHtml(s.session_id)}', this)">
+                <i class="fa-solid fa-play"></i> Resume
+            </button>
+        </div>
+    `).join('');
+}
+
+async function resumeStalledSession(sessionId, btnElement) {
+    if (btnElement) { btnElement.disabled = true; btnElement.innerText = 'Resuming…'; }
+    try {
+        const resp = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/resume`, { method: 'POST' });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            showFetchError(data.error || `Could not resume session '${sessionId}' (HTTP ${resp.status}).`);
+            if (btnElement) { btnElement.disabled = false; btnElement.innerHTML = '<i class="fa-solid fa-play"></i> Resume'; }
+            return;
+        }
+        // The resumed session is now "processing" -- both the pipeline banner
+        // (via fetchBriefing) and the stalled list need to reflect that.
+        await Promise.all([fetchBriefing(), loadStalledSessions()]);
+    } catch (e) {
+        showFetchError(`Could not resume session '${sessionId}': ${e.message}`);
+        if (btnElement) { btnElement.disabled = false; btnElement.innerHTML = '<i class="fa-solid fa-play"></i> Resume'; }
+    }
+}
+
+// ── Semantic search reindex (Settings tab) ──────────────────────────────────
+
+async function rebuildSemanticIndex() {
+    const btn = document.getElementById('btn-reindex');
+    const status = document.getElementById('reindex-status');
+    if (!btn || !status) return;
+
+    btn.disabled = true;
+    status.style.color = 'var(--text-muted)';
+    status.innerText = 'Indexing…';
+    try {
+        const resp = await fetch('/api/search/reindex', { method: 'POST' });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            status.style.color = '#a6432d';
+            status.innerText = data.error || `HTTP ${resp.status}`;
+        } else {
+            const stats = Object.entries(data)
+                .filter(([k]) => k !== 'status')
+                .map(([k, v]) => `${k}: ${v}`)
+                .join(', ');
+            status.style.color = '#33513e';
+            status.innerText = stats ? `Indexed (${stats}).` : 'Indexed.';
+        }
+    } catch (e) {
+        status.style.color = '#a6432d';
+        status.innerText = `Could not reach backend: ${e.message}`;
+    } finally {
+        btn.disabled = false;
+    }
+}
+
 async function recordMeetingFromCalendar(btnElement) {
     if (isRecording) {
-        alert("A recording is already in progress. Stop it first before starting a new one.");
+        showFetchError("A recording is already in progress. Stop it first before starting a new one.");
         return;
     }
 
@@ -345,7 +464,7 @@ async function startIsCall() {
     // the pre-meeting context modal entirely -- the IS call is the most
     // frequent action for this user, so it gets the fewest clicks.
     if (isRecording) {
-        alert("A recording is already in progress. Stop it first before starting a new one.");
+        showFetchError("A recording is already in progress. Stop it first before starting a new one.");
         return;
     }
     const btn = document.getElementById('btn-start-is-call');
@@ -404,33 +523,51 @@ function closePreMeetingModal() {
 }
 
 function _acceptPreMeetingFile(file) {
-    if (!file) return;
-    const name = file.name.toLowerCase();
-    if (name.endsWith('.eml') || name.endsWith('.msg')) {
-        // Emails are parsed immediately and folded into the agenda notes —
-        // deterministic alternative to the fuzzy "Search Outlook" button.
-        _importDroppedEmail(file);
+    if (!file) {
+        // Dragging straight from Outlook (or another mail client) often hands
+        // the browser a virtual attachment with no real file behind it --
+        // dataTransfer.files is empty and silently "nothing happens" without this.
+        document.getElementById('pmc-mail-status').textContent =
+            'No file received from the drag — save the email to disk first, then drop the file.';
         return;
     }
-    const allowed = ['.pdf', '.pptx', '.docx', '.txt'];
-    if (!allowed.some(ext => name.endsWith(ext))) {
+    const name = file.name.toLowerCase();
+    const docExts = ['.pdf', '.pptx', '.docx', '.txt'];
+    if (docExts.some(ext => name.endsWith(ext))) {
+        if (file.size > 50 * 1024 * 1024) {
+            showFetchError('File exceeds the 50MB limit.');
+            return;
+        }
+        _pmcSelectedFile = file;
+        const sizeKb = Math.round(file.size / 1024);
+        const el = document.getElementById('pmc-selected-file');
+        el.innerHTML = `<i class="fa-solid fa-file"></i> ${escHtml(file.name)} (${sizeKb} KB)`;
+        el.classList.remove('hidden');
+        return;
+    }
+    // .eml/.msg, and files with NO extension at all (mail clients often save
+    // messages with no suffix), go to the email importer — the backend
+    // sniffs the content and, if it can't parse the file, returns an error
+    // listing the accepted formats (shown in #pmc-mail-status). A file with
+    // some OTHER recognised-but-unsupported extension (.jpg, .doc, ...) is
+    // rejected immediately here instead: routing it to the mail endpoint
+    // would only produce a confusing "not a recognisable email file" error
+    // that omits the fact that documents are also accepted.
+    const hasExtension = /\.[a-z0-9]{1,5}$/i.test(name);
+    if (hasExtension && !name.endsWith('.eml') && !name.endsWith('.msg')) {
         showFetchError('Unsupported file type. Allowed: PDF, PPTX, DOCX, TXT — or an email as .eml/.msg.');
         return;
     }
-    if (file.size > 50 * 1024 * 1024) {
-        showFetchError('File exceeds the 50MB limit.');
-        return;
-    }
-    _pmcSelectedFile = file;
-    const sizeKb = Math.round(file.size / 1024);
-    const el = document.getElementById('pmc-selected-file');
-    el.innerHTML = `<i class="fa-solid fa-file"></i> ${escHtml(file.name)} (${sizeKb} KB)`;
-    el.classList.remove('hidden');
+    _importDroppedEmail(file);
 }
 
 async function _importDroppedEmail(file) {
     const statusEl = document.getElementById('pmc-mail-status');
     const agendaEl = document.getElementById('pmc-agenda');
+    if (file.size > 50 * 1024 * 1024) {
+        statusEl.textContent = 'File exceeds the 50MB limit.';
+        return;
+    }
     statusEl.textContent = `Parsing ${file.name}…`;
     try {
         const fd = new FormData();
@@ -468,7 +605,8 @@ async function fetchPreMeetingMailContext() {
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ subject_hint: hint }),
         });
-        const data = await resp.json();
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
         if (data.status === 'found' && data.body) {
             const marker = '\n\n--- Matched email context ---\n';
             if (!agendaEl.value.includes(marker)) {
@@ -832,6 +970,7 @@ async function syncCalendar(buttonId, statusId) {
 }
 
 let liveTranscriptEventSource = null;
+let _liveFrameParseWarned = false;
 let _elapsedTimerHandle = null;
 
 function _formatElapsed(ms) {
@@ -878,14 +1017,34 @@ function updateRecordingBtn() {
         
         if (!liveTranscriptEventSource) {
             liveTranscriptEventSource = new EventSource('/api/record/live');
+            _liveFrameParseWarned = false;
             liveTranscriptEventSource.onmessage = function(event) {
-                const data = JSON.parse(event.data);
+                let data;
+                try {
+                    data = JSON.parse(event.data);
+                } catch (e) {
+                    // A single malformed SSE frame must not kill the whole
+                    // stream handler — skip it (and warn only once per stream
+                    // to avoid flooding the console).
+                    if (!_liveFrameParseWarned) {
+                        _liveFrameParseWarned = true;
+                        console.warn('Skipping malformed live-transcript frame:', event.data);
+                    }
+                    return;
+                }
                 if (data.text && data.text.trim().length > 0) {
                     liveTranscriptText.innerText = data.text;
                     liveTranscriptText.scrollTop = liveTranscriptText.scrollHeight;
                 } else if (isRecording) {
                     // Empty text = model loaded and waiting for speech
                     liveTranscriptText.innerText = 'Listening...';
+                }
+            };
+            liveTranscriptEventSource.onerror = function() {
+                // The browser reconnects EventSource automatically — do NOT
+                // close the source here, just tell the user what's happening.
+                if (liveTranscriptText) {
+                    liveTranscriptText.innerText = 'Live transcript stream interrupted — reconnecting…';
                 }
             };
         }
@@ -970,6 +1129,10 @@ function switchTab(tabId) {
 
 // ── Review / Apply UI ─────────────────────────────────────────────────────────
 
+// session_id → accepted_count from the last submitReview in this page session;
+// used by applySession's confirmation dialog.
+const _acceptedCountBySession = {};
+
 // P2.5: the same 8-value owner_type vocabulary the extraction pipeline
 // classifies against (mcp_server/tools/extraction.py's _VALID_OWNER_TYPES) --
 // kept in sync by hand since the frontend has no import from the Python side.
@@ -1043,12 +1206,22 @@ function renderReviewAwaiting(sessions, activeProjects) {
     }
     container.innerHTML = sessions.map(s => `
         <div class="glass-panel" style="margin-bottom:1.5rem;padding:1.25rem;" id="session-block-${escHtml(s.session_id)}">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;flex-wrap:wrap;margin-bottom:0.5rem;">
                 <strong style="color:var(--primary);">Session: ${escHtml(s.session_id)}</strong>
-                <button class="btn-primary" onclick="submitReview('${escHtml(s.session_id)}')"
-                        style="padding:6px 16px;font-size:0.85rem;">
-                    <i class="fa-solid fa-paper-plane"></i> Submit Review
-                </button>
+                <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+                    <button class="btn-secondary" onclick="setAllReviewDecisions('${escHtml(s.session_id)}', 'accept')"
+                            style="padding:6px 12px;font-size:0.8rem;">
+                        <i class="fa-solid fa-check-double"></i> Accept all
+                    </button>
+                    <button class="btn-secondary" onclick="setAllReviewDecisions('${escHtml(s.session_id)}', 'reject')"
+                            style="padding:6px 12px;font-size:0.8rem;color:#a6432d;">
+                        <i class="fa-solid fa-xmark"></i> Reject all
+                    </button>
+                    <button class="btn-primary" onclick="submitReview('${escHtml(s.session_id)}')"
+                            style="padding:6px 16px;font-size:0.85rem;">
+                        <i class="fa-solid fa-paper-plane"></i> Submit Review
+                    </button>
+                </div>
             </div>
             ${(s.quality_label) ? `<div style="margin-bottom:0.75rem;">${_qualityBadge(s.quality_label, s.quality_score, s.quality_flags)}</div>` : ''}
             ${s.items.length === 0
@@ -1130,6 +1303,22 @@ function renderReviewItem(sessionId, item, activeProjects) {
         </div>`;
 }
 
+function _setReviewItemDecision(itemId, decision) {
+    // Single source of truth for flipping one item's Accept/Reject state —
+    // checking the radio is exactly what an individual click does, so the
+    // bulk buttons below produce the same visual + submit state per item.
+    const radio = document.querySelector(`input[name="dec-${itemId}"][value="${decision}"]`);
+    if (radio) radio.checked = true;
+}
+
+function setAllReviewDecisions(sessionId, decision) {
+    const block = document.getElementById('session-block-' + sessionId);
+    if (!block) return;
+    block.querySelectorAll('[id^="item-"]').forEach(el => {
+        _setReviewItemDecision(el.id.replace('item-', ''), decision);
+    });
+}
+
 async function submitReview(sessionId) {
     const block = document.getElementById('session-block-' + sessionId);
     if (!block) return;
@@ -1174,6 +1363,10 @@ async function submitReview(sessionId) {
         });
         const data = await resp.json();
         if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        // Remember how many items were accepted so the Apply confirmation can
+        // say "Apply N accepted item(s)" (the awaiting-apply endpoint only
+        // returns session ids, not per-item decisions).
+        _acceptedCountBySession[sessionId] = data.accepted_count;
         block.innerHTML = `<div style="padding:0.5rem;display:flex;align-items:center;gap:0.75rem;">
             <span class="stamp stamp-pine">Reviewed</span>
             <span>${data.accepted_count} accepted, ${data.rejected_count} rejected for <strong>${escHtml(sessionId)}</strong>. Reload to apply.</span>
@@ -1206,6 +1399,18 @@ function renderReviewApply(sessionIds) {
 
 async function applySession(sessionId) {
     const block = document.getElementById('apply-block-' + sessionId);
+    // Confirm before writing to todo.md. The accepted count is only known if
+    // the review was submitted in this page session; otherwise fall back to a
+    // generic phrasing rather than guessing a number.
+    const acceptedCount = _acceptedCountBySession[sessionId];
+    const confirmed = await showConfirmModal({
+        title: 'Apply to todo.md',
+        body: acceptedCount != null
+            ? `Apply ${acceptedCount} accepted item(s) to todo.md?`
+            : 'Apply the accepted item(s) of this session to todo.md?',
+        confirmLabel: 'Apply',
+    });
+    if (!confirmed) return;
     try {
         const resp = await fetch('/api/review/apply', {
             method: 'POST',
@@ -1400,12 +1605,49 @@ function toggleTranscript() {
 document.addEventListener('click', function(e) {
     const modal = document.getElementById('meeting-detail-modal');
     if (modal && e.target === modal) closeMeetingDetail();
+    const confirmModal = document.getElementById('confirm-modal');
+    if (confirmModal && e.target === confirmModal) _settleConfirmModal(false);
 });
 
 // Close modal on Escape key
 document.addEventListener('keydown', function(e) {
-    if (e.key === 'Escape') closeMeetingDetail();
+    if (e.key === 'Escape') {
+        closeMeetingDetail();
+        _settleConfirmModal(false);
+    }
 });
+
+// ── Reusable confirm modal (replaces native confirm()) ────────────────────────
+
+let _confirmModalResolve = null;
+
+// showConfirmModal({title, body, confirmLabel, danger}) → Promise<boolean>
+// Resolves true on confirm; false on Cancel, backdrop click, or Escape.
+function showConfirmModal({ title, body, confirmLabel, danger } = {}) {
+    const modal = document.getElementById('confirm-modal');
+    if (!modal) return Promise.resolve(false);
+    // Settle any confirm already on screen so its promise never dangles.
+    _settleConfirmModal(false);
+    document.getElementById('confirm-modal-title').textContent = title || 'Are you sure?';
+    document.getElementById('confirm-modal-body').textContent = body || '';
+    const okBtn = document.getElementById('confirm-modal-ok');
+    okBtn.textContent = confirmLabel || 'Confirm';
+    okBtn.style.background = danger ? '#a6432d' : '';
+    modal.classList.add('open');
+    okBtn.focus();
+    return new Promise(resolve => { _confirmModalResolve = resolve; });
+}
+
+function _settleConfirmModal(result) {
+    const modal = document.getElementById('confirm-modal');
+    if (!modal || !modal.classList.contains('open')) return;
+    modal.classList.remove('open');
+    if (_confirmModalResolve) {
+        const resolve = _confirmModalResolve;
+        _confirmModalResolve = null;
+        resolve(result);
+    }
+}
 
 // ── System / Server Control ────────────────────────────────────────────────────
 
@@ -1502,7 +1744,8 @@ async function llmStart() {
     if (msg) msg.textContent = 'Starting…';
     try {
         const resp = await fetch('/api/server/llm/start', { method: 'POST' });
-        const d = await resp.json();
+        const d = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(d.error || `HTTP ${resp.status}`);
         if (msg) msg.textContent = d.status === 'already_running'
             ? `Already running (PID ${d.pid})`
             : `Started (PID ${d.pid})`;
@@ -1517,7 +1760,8 @@ async function llmStop() {
     if (msg) msg.textContent = 'Stopping…';
     try {
         const resp = await fetch('/api/server/llm/stop', { method: 'POST' });
-        const d = await resp.json();
+        const d = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(d.error || `HTTP ${resp.status}`);
         if (msg) msg.textContent = d.status === 'not_running' ? 'LLM server was not running.' : 'Stopped.';
         loadSystemStatus();
     } catch (e) {
@@ -1527,13 +1771,18 @@ async function llmStop() {
 
 async function confirmResetData() {
     const statusEl = document.getElementById('reset-status');
-    if (!confirm('Delete ALL meeting records, session state, pending reviews, and clear todo.md?\n\nThis cannot be undone.')) {
-        return;
-    }
+    const confirmed = await showConfirmModal({
+        title: 'Reset All Data',
+        body: 'Delete ALL meeting records, session state, pending reviews, and clear todo.md? This cannot be undone.',
+        confirmLabel: 'Delete everything',
+        danger: true,
+    });
+    if (!confirmed) return;
     if (statusEl) statusEl.textContent = 'Resetting…';
     try {
         const resp = await fetch('/api/data/reset', { method: 'POST' });
-        const d = await resp.json();
+        const d = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(d.error || `HTTP ${resp.status}`);
         if (statusEl) statusEl.textContent =
             `Done — cleared meetings:${d.cleared.meetings}, state:${d.cleared.state}, pending:${d.cleared.pending_review}`;
         // Refresh the dashboard data

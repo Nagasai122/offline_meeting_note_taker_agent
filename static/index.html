@@ -118,6 +118,19 @@
                 </div>
             </div>
 
+            <!-- Stalled sessions: parked at STOPPED/TRANSCRIBED/EXTRACTED with no
+                 pipeline currently driving them (most often an LLM-unavailable
+                 error). Shown across all tabs, like error-banner above, since a
+                 stalled session is not itself tied to any one tab's view.
+                 Populated by loadStalledSessions() -> GET /api/sessions/stalled. -->
+            <div id="stalled-sessions-banner" class="glass-panel hidden" style="background: rgba(184, 134, 46, 0.10); border-left: 4px solid #b8862e; padding: 1.1rem 1.4rem;">
+                <div style="display:flex; align-items:center; gap:0.75rem; margin-bottom:0.75rem;">
+                    <i class="fa-solid fa-triangle-exclamation" style="color: #b8862e; font-size: 1.6rem;"></i>
+                    <h3 style="color: #b8862e; margin: 0;">Stalled sessions</h3>
+                </div>
+                <div id="stalled-sessions-list" style="display:flex; flex-direction:column; gap:0.6rem;"></div>
+            </div>
+
             <div id="view-dashboard" class="dashboard-grid">
                 <!-- Left Column -->
                 <div class="col-main">
@@ -609,6 +622,19 @@
                         <span id="import-status" style="margin-left:1rem; font-size:0.85rem; color:var(--text-muted);"></span>
                     </div>
 
+                    <div class="glass-panel" style="padding: 1.2rem; margin-bottom: 1rem;">
+                        <h3 style="margin: 0 0 0.8rem; font-size: 1rem;"><i class="fa-solid fa-magnifying-glass-chart"></i> Semantic Search</h3>
+                        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem;">
+                            Rebuild the local semantic-search index over reviewed sessions so search results include
+                            meaning-based matches, not just keyword matches. Runs entirely on CPU from the embedding
+                            model cached by <code>meeting-agent setup</code>; safe to re-run any time.
+                        </p>
+                        <button id="btn-reindex" class="btn-primary" onclick="rebuildSemanticIndex()">
+                            <i class="fa-solid fa-arrows-rotate"></i> Rebuild semantic index
+                        </button>
+                        <span id="reindex-status" style="margin-left: 1rem; font-size: 0.85rem; color: var(--text-muted);"></span>
+                    </div>
+
                     <div class="glass-panel" style="padding: 1.2rem;">
                         <h3 style="margin: 0 0 0.8rem; font-size: 1rem;"><i class="fa-solid fa-shield-halved"></i> Privacy Notice — Mail Context</h3>
                         <p style="font-size: 0.85rem; color: var(--text-muted);">
@@ -721,7 +747,7 @@
             <div id="pmc-error" style="color:#a6432d;font-size:0.85rem;margin-bottom:0.75rem;"></div>
 
             <div class="form-row">
-                <label class="field-label" id="pmc-dropzone-label">Document or email (optional — PDF, PPTX, DOCX, TXT, or a dragged email as EML/MSG, max 50MB)</label>
+                <label class="field-label" id="pmc-dropzone-label">Document or email (optional — PDF, PPTX, DOCX, TXT, or an email as EML/MSG or without an extension, max 50MB)</label>
                 <div id="pmc-dropzone" class="drop-zone" tabindex="0" role="button"
                      aria-labelledby="pmc-dropzone-label"
                      onclick="document.getElementById('pmc-file-input').click()"
@@ -753,6 +779,20 @@
                     <i class="fa-solid fa-microphone"></i> Start Recording
                 </button>
                 <button class="btn-secondary" onclick="closePreMeetingModal()">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Reusable confirm modal (replaces native confirm() dialogs).
+         Driven by showConfirmModal({title, body, confirmLabel, danger}) in app.js. -->
+    <div id="confirm-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title">
+        <div class="modal-box" style="max-width: 460px;">
+            <button class="modal-close-btn" aria-label="Cancel and close" onclick="_settleConfirmModal(false)">&#x2715;</button>
+            <h2 id="confirm-modal-title" style="color:var(--primary);margin-bottom:0.75rem;"></h2>
+            <p id="confirm-modal-body" style="color:var(--text-muted);font-size:0.9rem;margin-bottom:1.25rem;"></p>
+            <div class="form-actions">
+                <button id="confirm-modal-ok" class="btn-primary" onclick="_settleConfirmModal(true)">Confirm</button>
+                <button class="btn-secondary" onclick="_settleConfirmModal(false)">Cancel</button>
             </div>
         </div>
     </div>

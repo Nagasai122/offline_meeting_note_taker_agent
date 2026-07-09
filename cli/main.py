@@ -612,21 +612,29 @@ def app_command() -> None:
 
 
 @app.command()
-def index(
+def reindex(
     settings_path: Path = typer.Option(DEFAULT_SETTINGS_PATH),
 ) -> None:
-    """(Re)build the local semantic-search index over reviewed sessions.
+    """(Re)build the local semantic-search index over reviewed sessions --
+    the CLI counterpart of the dashboard's Settings -> "Rebuild semantic
+    index" button (POST /api/search/reindex in cli/web.py), for scripting or
+    running without the dashboard up. Path derivation and the failure hint
+    are shared with that endpoint via cli.semantic_search.index_paths/
+    INDEX_UNAVAILABLE_HINT so the two can't drift; a missing/uncached
+    embedding model exits non-zero so a scripted/cron caller can detect it.
 
-    Local-only: embeddings run on CPU from the model cached by `setup`;
-    the index (data/semantic_index.db) is derived data, safe to delete.
+    Local-only: embeddings run on CPU from the model cached by `setup`; the
+    index (data/semantic_index.db) is derived data, safe to delete.
     """
-    from cli.semantic_search import refresh_index
+    from cli.semantic_search import INDEX_UNAVAILABLE_HINT, index_paths, refresh_index
 
     settings = load_settings(settings_path)
-    meetings_dir = Path(settings.paths.data_dir) / "meetings"
-    state_dir = Path(settings.paths.data_dir) / "state"
-    db_path = Path(settings.paths.data_dir) / "semantic_index.db"
-    stats = refresh_index(meetings_dir, state_dir, db_path)
+    meetings_dir, state_dir, db_path = index_paths(settings.paths.data_dir)
+    try:
+        stats = refresh_index(meetings_dir, state_dir, db_path)
+    except Exception as exc:
+        typer.echo(f"Semantic indexing unavailable: {exc}. {INDEX_UNAVAILABLE_HINT}", err=True)
+        raise typer.Exit(code=1)
     typer.echo(f"Semantic index updated: {stats}")
 
 
