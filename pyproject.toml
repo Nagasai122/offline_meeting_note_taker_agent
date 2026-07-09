@@ -25,13 +25,20 @@ dependencies = [
     "winotify>=1.1; sys_platform == 'win32'",
     "portalocker>=2.7",
     "sse-starlette>=1.6",
+    "openpyxl>=3.1",
+    "pytesseract>=0.3",
+    # Moved here from the `app` extra (P3): now a doc-ingestion dependency
+    # (extract_text_from_image, cli/doc_ingest.py), not just the tray icon --
+    # pytesseract itself requires Pillow, but being explicit about it here
+    # avoids depending on that transitively.
+    "Pillow>=10.0",
 ]
 
 [project.optional-dependencies]
 diarisation = ["pyannote.audio>=3.3"]
 semantic-search = ["fastembed>=0.3", "sqlite-vec>=0.1.6"]
 mail-msg = ["extract-msg>=0.45"]
-app = ["pystray>=0.19", "Pillow>=10.0"]
+app = ["pystray>=0.19"]
 dev = ["pytest>=8.0", "pytest-cov>=5.0", "hypothesis>=6.100"]
 
 [project.scripts]

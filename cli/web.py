@@ -16,6 +16,8 @@ import threading
 import time
 from llm.http_probe import make_local_client, probe_ok
 
+from concurrency.atomic import atomic_write_text
+from concurrency.lock import FileLock
 from config.loader import load_settings
 from cli.briefing import build_daily_briefing
 from audio_capture.session_buffer import sweep_orphaned_audio
@@ -522,39 +524,66 @@ async def log_highlight(req: HighlightRequest | None = None):
         return {"status": "not recording"}
 
     highlight_path = Path(settings.paths.data_dir) / "meetings" / f"{active_session_id}.highlights.json"
-    highlights = []
-    if highlight_path.exists():
-        highlights = json.loads(highlight_path.read_text(encoding="utf-8"))
 
-    if req and req.update_last and highlights:
-        highlights[-1]["note"] = req.note
-        highlights[-1]["segment_offset_seconds"] = req.segment_offset_seconds
-    else:
-        entry = {"timestamp": datetime.now().isoformat()}
-        if req and req.note:
-            entry["note"] = req.note
-        if req and req.segment_offset_seconds is not None:
-            entry["segment_offset_seconds"] = req.segment_offset_seconds
-        highlights.append(entry)
+    # P3.4: FileLock around the whole read-modify-write. atomic_write_text
+    # alone (the prior state) only guarantees the WRITE itself is torn-read
+    # safe -- it does nothing to stop two overlapping requests (the bare
+    # click + its update_last=true follow-up racing a second rapid click)
+    # from both reading the same pre-update `highlights` list and each
+    # writing back a version missing the other's change. Same global lock
+    # every other read-modify-write in this project already uses.
+    with FileLock(settings.concurrency.lock_path, timeout_seconds=settings.concurrency.lock_timeout_seconds):
+        highlights = []
+        if highlight_path.exists():
+            highlights = json.loads(highlight_path.read_text(encoding="utf-8"))
 
-    # atomic_write_text rather than a plain write_text: this is a
-    # read-modify-write of a JSON list, called repeatedly while a recording
-    # is live -- a crash mid-write previously risked truncating/corrupting
-    # highlights.json, which extract_action_items also reads back into the
-    # extraction prompt.
-    atomic_write_text(highlight_path, json.dumps(highlights))
+        if req and req.update_last and highlights:
+            highlights[-1]["note"] = req.note
+            highlights[-1]["segment_offset_seconds"] = req.segment_offset_seconds
+        else:
+            entry = {"timestamp": datetime.now().isoformat()}
+            if req and req.note:
+                entry["note"] = req.note
+            if req and req.segment_offset_seconds is not None:
+                entry["segment_offset_seconds"] = req.segment_offset_seconds
+            highlights.append(entry)
+
+        # atomic_write_text rather than a plain write_text: this is a
+        # read-modify-write of a JSON list, called repeatedly while a recording
+        # is live -- a crash mid-write previously risked truncating/corrupting
+        # highlights.json, which extract_action_items also reads back into the
+        # extraction prompt.
+        atomic_write_text(highlight_path, json.dumps(highlights))
     return {"status": "highlight_logged"}
 
-_SUPPORTED_DOC_SUFFIXES = {".pdf", ".pptx", ".docx", ".txt"}
+_SUPPORTED_DOC_SUFFIXES = {".pdf", ".pptx", ".docx", ".txt", ".xlsx", ".png", ".jpg", ".jpeg"}
 _MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50MB
 
 
 @app.post("/api/context/upload")
-async def upload_context_document(session_id: str = Form(...), file: UploadFile = File(...)):
-    """Pre-meeting document context upload (architecture_v2.md §7.3): extracts
-    text offline, summarises it via the local LLM (bounded to ~1000 tokens),
-    and writes data/meetings/<session_id>.doc_context.txt."""
+async def upload_context_document(session_id: str | None = Form(None), file: UploadFile = File(...)):
+    """Document context upload (architecture_v2.md §7.3): extracts text
+    offline, summarises it via the local LLM (bounded to ~1000 tokens per
+    attachment), and appends it (labelled by filename) to
+    data/meetings/<session_id>.doc_context.txt.
+
+    P3: no longer pre-meeting only -- `session_known` below already accepts
+    a session actively in RECORDING state (session_id == active_session_id),
+    so this endpoint doubles as the mid-recording "Add Context" upload path.
+    session_id is now optional: the pre-meeting modal still passes it
+    explicitly (it has the just-started session's id in hand from
+    /api/record/start's response), but the mid-recording "Add Context"
+    button (static/app.js) omits it entirely and relies on the server's own
+    active_session_id, the same way POST /api/record/highlight already
+    does -- the frontend has never tracked the current session_id as
+    client-side state, and there's no reason for this endpoint to be the
+    first to require it."""
     from mcp_server.schemas import validate_session_id, SchemaValidationError
+
+    if session_id is None:
+        session_id = active_session_id
+    if not session_id:
+        return JSONResponse({"error": "Not recording, and no session_id provided."}, status_code=400)
 
     try:
         validate_session_id(session_id)
@@ -591,16 +620,23 @@ async def upload_context_document(session_id: str = Form(...), file: UploadFile 
     tmp_path.write_bytes(contents)
 
     try:
-        from cli.doc_ingest import ingest_document
+        from cli.doc_ingest import add_document_context
         from llm.client import HttpLLMClient
 
         llm_client = HttpLLMClient(base_url=f"http://{settings.llm.host}:{settings.llm.port}")
         output_path = await asyncio.to_thread(
-            ingest_document, tmp_path, session_id, meetings_dir, llm_client.complete
+            add_document_context, tmp_path, session_id, meetings_dir, llm_client.complete,
+            settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
+            source_label=safe_filename,
         )
-        summary_tokens = len(output_path.read_text(encoding="utf-8").split())
+        summary_tokens = len(output_path.read_text(encoding="utf-8").split()) if output_path.exists() else 0
     except (ValueError, NotImplementedError) as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
+    except RuntimeError as exc:
+        # extract_text_from_image's Tesseract-not-installed error -- a setup
+        # problem, not a bad request, but still something the caller needs
+        # surfaced rather than a bare 500.
+        return JSONResponse({"error": str(exc)}, status_code=503)
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -608,6 +644,62 @@ async def upload_context_document(session_id: str = Form(...), file: UploadFile 
         "status": "processed", "session_id": session_id,
         "filename": safe_filename, "summary_tokens": summary_tokens,
     })
+
+
+class TextContextRequest(BaseModel):
+    session_id: str | None = None
+    text: str
+
+
+_MAX_PASTED_TEXT_CHARS = 20_000
+
+
+@app.post("/api/context/text")
+async def add_text_context(req: TextContextRequest):
+    """P3.3: pasted text/Teams-chat-snippet context, mid-recording or
+    pre-meeting alike -- same accumulation pipeline as
+    POST /api/context/upload (add_pasted_text_context appends a labelled
+    section to the same data/meetings/<session_id>.doc_context.txt sidecar,
+    under the same FileLock), just without a file/tmp-path round trip since
+    there's no upload to stage first. session_id is optional -- same
+    active_session_id fallback as /api/context/upload above, for the same
+    reason."""
+    from mcp_server.schemas import validate_session_id, SchemaValidationError
+
+    session_id = req.session_id or active_session_id
+    if not session_id:
+        return JSONResponse({"error": "Not recording, and no session_id provided."}, status_code=400)
+
+    try:
+        validate_session_id(session_id)
+    except SchemaValidationError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+
+    text = req.text.strip()
+    if not text:
+        return JSONResponse({"error": "text must not be empty."}, status_code=422)
+    if len(text) > _MAX_PASTED_TEXT_CHARS:
+        return JSONResponse(
+            {"error": f"text exceeds the {_MAX_PASTED_TEXT_CHARS}-character limit."}, status_code=413,
+        )
+
+    meetings_dir = Path(settings.paths.data_dir) / "meetings"
+    state_dir = Path(settings.paths.data_dir) / "state"
+    session_known = (state_dir / f"{session_id}.json").exists() or any(
+        meetings_dir.glob(f"{session_id}.*")
+    ) or session_id == active_session_id
+    if not session_known:
+        return JSONResponse({"error": f"Unknown session '{session_id}'."}, status_code=404)
+
+    from cli.doc_ingest import add_pasted_text_context
+    from llm.client import HttpLLMClient
+
+    llm_client = HttpLLMClient(base_url=f"http://{settings.llm.host}:{settings.llm.port}")
+    output_path = await asyncio.to_thread(
+        add_pasted_text_context, text, session_id, meetings_dir, llm_client.complete,
+        settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
+    )
+    return JSONResponse({"status": "processed", "session_id": session_id, "path": str(output_path)})
 
 
 class MailContextRequest(BaseModel):
@@ -1856,6 +1948,12 @@ async def server_status():
     except OSError:
         pass
 
+    # P3.6: OCR health-check -- cached after the first call, so offloading to
+    # a thread only actually matters (avoids blocking the event loop) the
+    # very first time this endpoint is polled after startup.
+    from cli.doc_ingest import is_ocr_available
+    ocr_available = await asyncio.to_thread(is_ocr_available)
+
     return JSONResponse({
         "uptime": uptime_str,
         "uptime_seconds": uptime_seconds,
@@ -1867,6 +1965,7 @@ async def server_status():
         "processing": processing,
         "pipeline_stage": pipeline_stage,
         "active_session": active_session_id,
+        "ocr_available": ocr_available,
     })
 
 

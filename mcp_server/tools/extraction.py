@@ -40,6 +40,7 @@ from pathlib import Path
 
 from llm.client import LLMClient
 from concurrency.atomic import atomic_write_text
+from concurrency.lock import FileLock
 from config.loader import IdentityConfig
 from mcp_server import state as state_mod
 from mcp_server.meeting_type import MeetingType, load_meeting_type
@@ -288,8 +289,16 @@ def extract_action_items(
     if context_path.exists():
         additional_context += f"\n\nMEETING CONTEXT:\n{context_path.read_text(encoding='utf-8')}\n"
 
+    # P3.4: FileLock around the read, matching the lock cli/doc_ingest.py's
+    # add_document_context/add_pasted_text_context now take on the write
+    # side -- context can arrive throughout a live recording (not just
+    # pre-meeting), so a write landing mid-read is a real possibility here,
+    # not just a theoretical one.
     if doc_context_path.exists():
-        additional_context += f"\n\nPRE-MEETING DOCUMENT CONTEXT (summarised):\n{doc_context_path.read_text(encoding='utf-8')}\n"
+        with FileLock(lock_path, timeout_seconds=lock_timeout):
+            doc_context_text = doc_context_path.read_text(encoding='utf-8') if doc_context_path.exists() else ""
+        if doc_context_text:
+            additional_context += f"\n\nDOCUMENT CONTEXT (summarised):\n{doc_context_text}\n"
 
     if mail_context_path.exists():
         additional_context += f"\n\nMATCHED EMAIL CONTEXT:\n{mail_context_path.read_text(encoding='utf-8')}\n"
@@ -314,7 +323,8 @@ def extract_action_items(
         additional_context += chaining_ctx
 
     if highlight_path.exists():
-        highlights = json.loads(highlight_path.read_text(encoding="utf-8"))
+        with FileLock(lock_path, timeout_seconds=lock_timeout):
+            highlights = json.loads(highlight_path.read_text(encoding="utf-8"))
         additional_context += (
             f"\n\nIMPORTANT HIGHLIGHTS: The user explicitly highlighted {len(highlights)} moments "
             "during this recording. Pay special attention to the topics discussed."

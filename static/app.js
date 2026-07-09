@@ -4,6 +4,7 @@ document.addEventListener('DOMContentLoaded', () => {
     
     document.getElementById('btn-toggle-record').addEventListener('click', toggleRecording);
     document.getElementById('btn-highlight').addEventListener('click', logHighlight);
+    document.getElementById('btn-add-context').addEventListener('click', toggleAddContextPanel);
 });
 
 let isRecording = false;
@@ -671,6 +672,135 @@ async function _saveHighlightNote(note) {
     }
 }
 
+// ── Mid-recording "Add Context" (P3.7) ──────────────────────────────────────
+// Neither POST /api/context/upload nor POST /api/context/text is called with
+// a session_id here -- both endpoints fall back to the server's own
+// active_session_id when it's omitted (cli/web.py), the same convention
+// POST /api/record/highlight already uses. That means this panel needs no
+// client-side session tracking at all, matching the Highlight button right
+// next to it.
+
+const _ADD_CONTEXT_ACCEPT = '.pdf,.pptx,.docx,.xlsx,.txt,.png,.jpg,.jpeg';
+
+function toggleAddContextPanel() {
+    const existing = document.getElementById('add-context-panel');
+    if (existing) {
+        _closeAddContextPanel();
+        return;
+    }
+    const btn = document.getElementById('btn-add-context');
+    const wrap = document.createElement('div');
+    wrap.id = 'add-context-panel';
+    wrap.className = 'glass-panel';
+    // Appended to <body> and positioned fixed, rather than inserted inline
+    // next to the button, deliberately: #btn-add-context lives inside the
+    // header's narrow recording-controls card, and a panel constrained to
+    // that flex item's width (~150px) squeezed the textarea/buttons down to
+    // the point of being unusable. A floating popover anchored under the
+    // button isn't fighting that parent's width at all.
+    wrap.style.cssText = 'position:fixed;z-index:900;width:320px;max-width:calc(100vw - 2rem);'
+        + 'padding:0.9rem;display:flex;flex-direction:column;gap:0.6rem;box-shadow:0 8px 24px rgba(0,0,0,0.25);';
+    wrap.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+            <strong style="font-size:0.85rem;">Add context to this recording</strong>
+            <button class="btn-icon" style="width:24px;height:24px;" aria-label="Close" onclick="_closeAddContextPanel()">
+                <i class="fa-solid fa-xmark"></i>
+            </button>
+        </div>
+        <textarea id="add-context-text-input" class="textarea-input" rows="2" maxlength="20000"
+                  placeholder="Paste text (e.g. a Teams chat snippet)…"></textarea>
+        <div style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center;">
+            <button id="btn-add-context-text-submit" class="btn-secondary" style="padding:6px 12px;font-size:0.8rem;"
+                    onclick="_submitAddContextText()">
+                <i class="fa-solid fa-paper-plane"></i> Add pasted text
+            </button>
+            <label class="btn-secondary" style="padding:6px 12px;font-size:0.8rem;cursor:pointer;margin:0;">
+                <i class="fa-solid fa-upload"></i> Upload file
+                <input type="file" id="add-context-file-input" accept="${_ADD_CONTEXT_ACCEPT}" style="display:none;"
+                       onchange="_submitAddContextFile(this)">
+            </label>
+        </div>
+        <div id="add-context-status" style="font-size:0.8rem;color:var(--text-muted);"></div>
+    `;
+    document.body.appendChild(wrap);
+
+    // Position under the button, flipped to the left edge if it would
+    // otherwise overflow the right side of the viewport.
+    const rect = btn.getBoundingClientRect();
+    const panelWidth = wrap.offsetWidth;
+    let left = rect.left;
+    if (left + panelWidth > window.innerWidth - 16) left = window.innerWidth - panelWidth - 16;
+    wrap.style.top = `${rect.bottom + 8}px`;
+    wrap.style.left = `${Math.max(16, left)}px`;
+
+    document.getElementById('add-context-text-input').focus();
+    // Close on an outside click, but not the click that just opened it.
+    setTimeout(() => document.addEventListener('click', _onAddContextOutsideClick), 0);
+}
+
+function _onAddContextOutsideClick(e) {
+    const wrap = document.getElementById('add-context-panel');
+    const btn = document.getElementById('btn-add-context');
+    if (!wrap) return;
+    if (wrap.contains(e.target) || (btn && btn.contains(e.target))) return;
+    _closeAddContextPanel();
+}
+
+function _closeAddContextPanel() {
+    const existing = document.getElementById('add-context-panel');
+    if (existing) existing.remove();
+    document.removeEventListener('click', _onAddContextOutsideClick);
+}
+
+function _setAddContextStatus(message, isError) {
+    const el = document.getElementById('add-context-status');
+    if (!el) return;
+    el.textContent = message;
+    el.style.color = isError ? '#a6432d' : '#33513e';
+}
+
+async function _submitAddContextText() {
+    const input = document.getElementById('add-context-text-input');
+    const text = input ? input.value.trim() : '';
+    if (!text) return;
+    const btn = document.getElementById('btn-add-context-text-submit');
+    if (btn) btn.disabled = true;
+    _setAddContextStatus('Adding…', false);
+    try {
+        const resp = await fetch('/api/context/text', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ text }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        input.value = '';
+        _setAddContextStatus('Added.', false);
+    } catch (e) {
+        _setAddContextStatus(`Could not add context: ${e.message}`, true);
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+async function _submitAddContextFile(fileInput) {
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) return;
+    _setAddContextStatus(`Uploading ${file.name}…`, false);
+    try {
+        const fd = new FormData();
+        fd.append('file', file);
+        const resp = await fetch('/api/context/upload', { method: 'POST', body: fd });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        _setAddContextStatus(`Added ${file.name}.`, false);
+    } catch (e) {
+        _setAddContextStatus(`Could not add ${file.name}: ${e.message}`, true);
+    } finally {
+        fileInput.value = '';
+    }
+}
+
 async function syncCalendar(buttonId, statusId) {
     // Generalized to take an explicit button/status pair so both the
     // Dashboard tab's and the Calendar tab's Sync buttons can share one
@@ -725,6 +855,7 @@ function updateRecordingBtn() {
     const statusText = document.getElementById('recording-status-text');
     const preMeetingControls = document.getElementById('pre-meeting-controls');
     const btnHighlight = document.getElementById('btn-highlight');
+    const btnAddContext = document.getElementById('btn-add-context');
     const liveTranscriptPanel = document.getElementById('live-transcript-panel');
     const liveTranscriptText = document.getElementById('live-transcript-text');
     const elapsedEl = document.getElementById('recording-elapsed');
@@ -737,6 +868,7 @@ function updateRecordingBtn() {
         statusText.innerText = 'Recording live...';
         preMeetingControls.classList.add('hidden');
         btnHighlight.classList.remove('hidden');
+        if (btnAddContext) btnAddContext.classList.remove('hidden');
         if (elapsedEl) {
             elapsedEl.classList.remove('hidden');
             _tickElapsed();
@@ -765,6 +897,8 @@ function updateRecordingBtn() {
         statusText.innerText = 'Ready to Record';
         preMeetingControls.classList.remove('hidden');
         btnHighlight.classList.add('hidden');
+        if (btnAddContext) btnAddContext.classList.add('hidden');
+        _closeAddContextPanel();
         document.getElementById('meeting-context').value = ""; // clear context
         if (liveTranscriptPanel) liveTranscriptPanel.classList.add('hidden');
         if (elapsedEl) {
@@ -1312,6 +1446,20 @@ async function loadSystemStatus() {
             } else {
                 sessEl.textContent = 'Idle';
                 sessEl.style.color = 'var(--text-muted)';
+            }
+        }
+
+        // P3.6: OCR health-check -- lets a missing Tesseract install be
+        // noticed here, ahead of time, rather than only the first time
+        // someone tries to add a screenshot as context mid-recording.
+        const ocrEl = el('stat-ocr');
+        if (ocrEl) {
+            if (d.ocr_available) {
+                ocrEl.textContent = 'Available';
+                ocrEl.style.color = '#33513e';
+            } else {
+                ocrEl.textContent = 'Not installed';
+                ocrEl.style.color = '#a6432d';
             }
         }
     } catch (e) {
