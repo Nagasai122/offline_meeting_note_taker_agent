@@ -253,6 +253,58 @@ def test_patch_task_full_edit(client):
     assert item.tag == "WP1"
 
 
+def test_patch_task_rejects_empty_description(client):
+    """Regression test: `if req.description and ...` is a falsy check, so
+    description="" used to skip validation entirely and silently blank the
+    task's description -- unlike task creation, which requires non-empty."""
+    c, dirs = client
+    _write_todo(dirs["todo_path"], "abc123")
+
+    resp = c.patch("/api/tasks/abc123", json={"description": ""})
+    assert resp.status_code == 422
+
+    resp_whitespace = c.patch("/api/tasks/abc123", json={"description": "   "})
+    assert resp_whitespace.status_code == 422
+
+    item = parse_todo(dirs["todo_path"]).items[0]
+    assert item.description == "Do the thing"  # untouched by the rejected PATCH
+
+
+def test_patch_task_strips_description_whitespace(client):
+    c, dirs = client
+    _write_todo(dirs["todo_path"], "abc123")
+
+    resp = c.patch("/api/tasks/abc123", json={"description": "  Trimmed  "})
+    assert resp.status_code == 200
+
+    item = parse_todo(dirs["todo_path"]).items[0]
+    assert item.description == "Trimmed"
+
+
+def test_patch_task_rejects_invalid_priority(client):
+    """Regression test: patch_task had no priority allow-list check, unlike
+    create_manual_task, letting arbitrary strings be written to todo.md."""
+    c, dirs = client
+    _write_todo(dirs["todo_path"], "abc123")
+
+    resp = c.patch("/api/tasks/abc123", json={"priority": "URGENT"})
+    assert resp.status_code == 422
+
+    item = parse_todo(dirs["todo_path"]).items[0]
+    assert item.priority is None  # untouched by the rejected PATCH
+
+
+def test_patch_task_accepts_valid_priority(client):
+    c, dirs = client
+    _write_todo(dirs["todo_path"], "abc123")
+
+    resp = c.patch("/api/tasks/abc123", json={"priority": "HIGH"})
+    assert resp.status_code == 200
+
+    item = parse_todo(dirs["todo_path"]).items[0]
+    assert item.priority == "HIGH"
+
+
 def test_duplicate_task_endpoint(client):
     c, dirs = client
     resp = c.post("/api/tasks/manual", json={"description": "Original task", "owner": "Naga"})
@@ -329,3 +381,36 @@ def test_add_task_attachment_rejects_unsupported_extension(client):
     )
     assert resp.status_code == 400
     assert not (dirs["data_dir"] / "task_attachments" / task_id).exists()
+
+
+def test_add_task_attachment_same_filename_twice_does_not_overwrite(client):
+    """Regression test: uploading two different files with the same name to
+    one task used to silently overwrite the first file's bytes on disk while
+    todo.md ended up with two attachment records both pointing at the same
+    (now-wrong) path -- the first upload's content was permanently lost with
+    no error surfaced."""
+    c, dirs = client
+    resp = c.post("/api/tasks/manual", json={"description": "Task with two same-named files"})
+    task_id = resp.json()["task_id"]
+
+    resp1 = c.post(
+        f"/api/tasks/{task_id}/attachments",
+        files={"file": ("notes.txt", b"first upload", "text/plain")},
+    )
+    assert resp1.status_code == 200
+    filename1 = resp1.json()["attachments"][0]["filename"]
+
+    resp2 = c.post(
+        f"/api/tasks/{task_id}/attachments",
+        files={"file": ("notes.txt", b"second upload", "text/plain")},
+    )
+    assert resp2.status_code == 200
+    attachments = resp2.json()["attachments"]
+    assert len(attachments) == 2
+    filename2 = attachments[1]["filename"]
+
+    # The second upload must have been disambiguated, not overwritten the first.
+    assert filename1 != filename2
+    attachments_dir = dirs["data_dir"] / "task_attachments" / task_id
+    assert (attachments_dir / filename1).read_bytes() == b"first upload"
+    assert (attachments_dir / filename2).read_bytes() == b"second upload"

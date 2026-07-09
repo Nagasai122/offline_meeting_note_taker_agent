@@ -262,9 +262,16 @@ def write_manual_task(
 
     todo_path = Path(todo_path)
     task_id = uuid4().hex[:8]
+    # Bug fix: a caller-supplied status="done" (e.g. logging already-
+    # completed work) used to leave `done` hardcoded to False, unlike
+    # update_task_status's handling of the same status value -- the
+    # resulting status="done"/done=False item was inconsistent state that
+    # kept showing up in cli/briefing.py's open-task dashboard buckets
+    # (which filter on `done`, not `status`) despite being marked done.
+    requested_status = task_data.get("status") or "todo"
     item = TodoItem(
         description=task_data["description"],
-        done=False,
+        done=requested_status == "done",
         id=task_id,
         title=task_data.get("title"),
         owner=task_data.get("owner"),
@@ -277,7 +284,7 @@ def write_manual_task(
         due_date=task_data.get("due_date"),
         session_id=None,
         priority=task_data.get("priority") or "MEDIUM",
-        status=task_data.get("status") or "todo",
+        status=requested_status,
         source="manual",
         progress_note=task_data.get("progress_note"),
         tag=task_data.get("tag"),
@@ -373,12 +380,20 @@ def duplicate_task(
         if source_item is None:
             raise KeyError(f"No task with id '{task_id}' found in {todo_path}.")
 
+        # Bug fix: dataclasses.replace only overrides the fields passed here
+        # -- comments/attachments were left unmentioned, so the clone
+        # inherited the SAME list objects (and hence the original's entire
+        # comment thread and file references) from source_item, directly
+        # contradicting this function's own "should not inherit that
+        # history" reasoning above. Reset both explicitly.
         clone = replace(
             source_item,
             id=uuid4().hex[:8],
             done=False,
             status="todo",
             source=f"duplicate-of-{task_id}",
+            comments=None,
+            attachments=None,
         )
         merged = TodoFile(items=existing.items + [clone])
         atomic_write_text(todo_path, format_todo_file(merged))

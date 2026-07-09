@@ -281,6 +281,25 @@ async def read_index():
     with open(static_dir / "index.html", "r", encoding="utf-8") as f:
         return f.read()
 
+# Serializes concurrent calendar syncs. Bug fix: this diff added a second
+# Sync button (Calendar tab, alongside the existing Dashboard-tab one),
+# making two near-simultaneous POST /api/calendar/sync calls a realistic
+# scenario for the first time. fetch_outlook_calendar (cli/teams_sync.py)
+# writes calendar.json via atomic_write_text with no lock of its own, and
+# atomic_write_text's temp filename is fixed (not unique per caller), so two
+# concurrent writers race on the same .tmp file with silent last-writer-wins
+# data loss as the best case. Same lazy-construction rationale as the other
+# module-level locks in this file.
+_calendar_sync_lock: asyncio.Lock | None = None
+
+
+def _get_calendar_sync_lock() -> asyncio.Lock:
+    global _calendar_sync_lock
+    if _calendar_sync_lock is None:
+        _calendar_sync_lock = asyncio.Lock()
+    return _calendar_sync_lock
+
+
 @app.post("/api/calendar/sync")
 async def sync_calendar_endpoint():
     """Explicit, user-triggered local Outlook calendar sync (COM, not network).
@@ -297,7 +316,8 @@ async def sync_calendar_endpoint():
         # froze the entire event loop, so the dashboard's own 5s polling and
         # every other request appeared to hang for the sync's whole duration,
         # which is most of why "click Sync" felt like it didn't do anything.
-        count = await asyncio.to_thread(fetch_outlook_calendar, calendar_cache)
+        async with _get_calendar_sync_lock():
+            count = await asyncio.to_thread(fetch_outlook_calendar, calendar_cache)
         return {"status": "synced", "count": count}
     except Exception as e:
         logger.warning("Calendar sync failed: %s", e)
@@ -390,6 +410,19 @@ def _get_recording_lock() -> asyncio.Lock:
     if _recording_lock is None:
         _recording_lock = asyncio.Lock()
     return _recording_lock
+
+
+# Guards _llm_server_proc across llm_start/llm_stop -- see llm_start's own
+# comment for why this is needed once llm_stop's termination wait moved to a
+# thread. Same lazy-construction rationale as _recording_lock above.
+_llm_lock: asyncio.Lock | None = None
+
+
+def _get_llm_lock() -> asyncio.Lock:
+    global _llm_lock
+    if _llm_lock is None:
+        _llm_lock = asyncio.Lock()
+    return _llm_lock
 
 
 @app.post("/api/record/start")
@@ -916,44 +949,65 @@ async def stop_recording(auto_accept: bool = False, session_id: str | None = Non
     SB-2.2: optional `session_id` parameter — when provided, the request is
     rejected with 409 if it doesn't match the currently-active session, so a
     stale or replayed stop request can't silently terminate the wrong session."""
-    global recording_processes, active_session_id, processing, _active_whisper_model
-    if not recording_processes:
-        return {"status": "not recording"}
-    if session_id is not None and session_id != active_session_id:
-        return JSONResponse(
-            {"error": f"session_id mismatch: request has '{session_id}', active is '{active_session_id}'"},
-            status_code=409,
-        )
+    global recording_processes, active_session_id, processing, _active_whisper_model, _processing_session_id
+    # Bug fix: this function used to rely on an accident -- the old blocking
+    # wait/kill loop below froze the whole single-worker event loop for its
+    # duration, which incidentally also prevented a concurrent
+    # start_recording from running at the same time. Once that wait was
+    # offloaded to a thread (see the comment further down), the event loop
+    # became free during the wait, so a fast Stop-then-Start could interleave:
+    # _start_recording_locked's guard could see one of the two recorder
+    # subprocesses already exited (mic/loopback don't exit at exactly the
+    # same instant) and proceed to start a new recording, which this
+    # function's unconditional `recording_processes = []` etc. below would
+    # then clobber. start_recording already serializes through
+    # _get_recording_lock() for exactly this class of race (see its own
+    # comment); stop_recording now holds the same lock for its whole
+    # critical section so the two can never interleave.
+    async with _get_recording_lock():
+        if not recording_processes:
+            return {"status": "not recording"}
+        if session_id is not None and session_id != active_session_id:
+            return JSONResponse(
+                {"error": f"session_id mismatch: request has '{session_id}', active is '{active_session_id}'"},
+                status_code=409,
+            )
 
-    sess_id = active_session_id
-    whisper_model_for_session = _active_whisper_model
+        sess_id = active_session_id
+        whisper_model_for_session = _active_whisper_model
 
-    # Signal both subprocesses to stop gracefully via sentinel files.  On Windows,
-    # p.terminate() = TerminateProcess() which kills instantly before Python's
-    # I/O buffer is flushed — the WAV writer's close() never runs, leaving a
-    # 0-byte or header-only WAV that libav can't open.  The sentinel file lets the
-    # record subprocess exit its poll loop normally so buffer.stop() / wave.close()
-    # runs and all data is safely on disk.
-    tmp_dir = Path(settings.paths.tmp_dir)
-    for sub_id in [f"{sess_id}-mic", f"{sess_id}-loop"]:
-        (tmp_dir / f"{sub_id}.stop").touch()
+        # Signal both subprocesses to stop gracefully via sentinel files.  On Windows,
+        # p.terminate() = TerminateProcess() which kills instantly before Python's
+        # I/O buffer is flushed — the WAV writer's close() never runs, leaving a
+        # 0-byte or header-only WAV that libav can't open.  The sentinel file lets the
+        # record subprocess exit its poll loop normally so buffer.stop() / wave.close()
+        # runs and all data is safely on disk.
+        tmp_dir = Path(settings.paths.tmp_dir)
+        for sub_id in [f"{sess_id}-mic", f"{sess_id}-loop"]:
+            (tmp_dir / f"{sub_id}.stop").touch()
 
-    # Bug fix: this wait/terminate loop is blocking (time.sleep, Popen.wait)
-    # and used to run directly inside this async def handler -- for up to
-    # ~4-6s, every other request (the dashboard's 5s polling, the live-
-    # transcript SSE stream, any other tab) froze, since uvicorn runs
-    # single-worker here by design. Offloaded to a thread, same pattern
-    # already used elsewhere in this file for other blocking calls.
-    await asyncio.to_thread(_wait_for_recording_processes_to_stop, recording_processes, 4.0)
+        # Bug fix: this wait/terminate loop is blocking (time.sleep, Popen.wait)
+        # and used to run directly inside this async def handler -- for up to
+        # ~4-6s, every other request (the dashboard's 5s polling, the live-
+        # transcript SSE stream, any other tab) froze, since uvicorn runs
+        # single-worker here by design. Offloaded to a thread, same pattern
+        # already used elsewhere in this file for other blocking calls. Safe
+        # to hold _recording_lock (an asyncio.Lock) across this await -- it
+        # only blocks other coroutines from acquiring the same lock, not the
+        # event loop itself.
+        await asyncio.to_thread(_wait_for_recording_processes_to_stop, recording_processes, 4.0)
 
-    recording_processes = []
-    active_session_id = None
-    _active_whisper_model = None
-    processing = True
+        recording_processes = []
+        active_session_id = None
+        _active_whisper_model = None
 
-    # Run the pipeline synchronously but offload to a background task so we don't block the UI
-    asyncio.create_task(run_pipeline(sess_id, auto_accept=auto_accept, whisper_model=whisper_model_for_session))
-    return {"status": "processing_started", "session_id": sess_id, "auto_accept": auto_accept}
+        # Recording has already stopped and its audio is safely on disk above --
+        # that part can never be rejected. The pipeline itself, however, must not
+        # race a still-running one for the shared `processing` lock (e.g. a
+        # resumed stalled session's pipeline still in flight), so it's scheduled
+        # via the same-serializing helper rather than claimed immediately here.
+        asyncio.create_task(_run_pipeline_when_free(sess_id, auto_accept, whisper_model_for_session))
+        return {"status": "processing_started", "session_id": sess_id, "auto_accept": auto_accept}
 
 @app.get("/api/record/live")
 async def get_live_transcript(request: Request):
@@ -1800,13 +1854,21 @@ async def server_status():
 async def llm_start():
     """Start the LLM server as a background process managed by the dashboard."""
     global _llm_server_proc
-    if _llm_server_proc is not None and _llm_server_proc.poll() is None:
-        return JSONResponse({"status": "already_running", "pid": _llm_server_proc.pid})
-    _llm_server_proc = subprocess.Popen(
-        [sys.executable, "-m", "cli.main", "serve"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    return JSONResponse({"status": "started", "pid": _llm_server_proc.pid})
+    # Bug fix: llm_stop's termination wait is offloaded to a thread (below),
+    # which frees the event loop for its duration -- without a lock, a
+    # concurrent llm_start could see the not-yet-reaped old process and
+    # wrongly report "already_running", or overwrite _llm_server_proc with a
+    # new process that llm_stop's unconditional `_llm_server_proc = None`
+    # (once its wait completes) would then orphan. Same _get_recording_lock
+    # pattern used for the analogous recording race.
+    async with _get_llm_lock():
+        if _llm_server_proc is not None and _llm_server_proc.poll() is None:
+            return JSONResponse({"status": "already_running", "pid": _llm_server_proc.pid})
+        _llm_server_proc = subprocess.Popen(
+            [sys.executable, "-m", "cli.main", "serve"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return JSONResponse({"status": "started", "pid": _llm_server_proc.pid})
 
 
 @app.post("/api/server/llm/stop")
@@ -1815,11 +1877,12 @@ async def llm_stop():
     global _llm_server_proc
     killed = []
 
-    # Kill the process we track explicitly
-    if _llm_server_proc is not None and _llm_server_proc.poll() is None:
-        killed.append(_llm_server_proc.pid)
-        await asyncio.to_thread(_terminate_and_wait, _llm_server_proc, 5)
-    _llm_server_proc = None
+    async with _get_llm_lock():
+        # Kill the process we track explicitly
+        if _llm_server_proc is not None and _llm_server_proc.poll() is None:
+            killed.append(_llm_server_proc.pid)
+            await asyncio.to_thread(_terminate_and_wait, _llm_server_proc, 5)
+        _llm_server_proc = None
 
     # Also kill any orphaned llama-server processes (from pipeline runs or prior sessions)
     try:
@@ -2079,7 +2142,12 @@ async def get_task(task_id: str):
     from mcp_server.todo import parse_todo
 
     todo_path = Path(settings.paths.data_dir) / "todo.md"
-    item = next((i for i in parse_todo(todo_path).items if i.id == task_id), None)
+    # Bug fix: parse_todo reparses the whole of todo.md -- offloaded the same
+    # way get_briefing/sync_calendar_endpoint are, so a large todo.md or lock
+    # contention elsewhere doesn't freeze the single-worker event loop for
+    # every task-detail click.
+    todo_file = await asyncio.to_thread(parse_todo, todo_path)
+    item = next((i for i in todo_file.items if i.id == task_id), None)
     if item is None:
         return JSONResponse({"error": f"No task with id '{task_id}'."}, status_code=404)
     return JSONResponse(_task_to_detail_dict(item))
@@ -2092,10 +2160,28 @@ async def patch_task(task_id: str, req: TaskPatchRequest):
 
     if req.status is not None and req.status not in _VALID_TASK_STATUSES:
         return JSONResponse({"error": f"status must be one of {sorted(_VALID_TASK_STATUSES)}"}, status_code=422)
+    # Bug fix: priority had no allow-list check here, unlike create_manual_task
+    # -- an arbitrary string (or "") could be PATCHed straight into todo.md's
+    # priority field with no validation.
+    if req.priority is not None and req.priority not in {"HIGH", "MEDIUM", "LOW"}:
+        return JSONResponse({"error": "priority must be one of HIGH/MEDIUM/LOW."}, status_code=422)
     if req.title and len(req.title) > 200:
         return JSONResponse({"error": "title must be at most 200 characters."}, status_code=422)
-    if req.description and len(req.description) > 500:
-        return JSONResponse({"error": "description must be at most 500 characters."}, status_code=422)
+    # Bug fix: `if req.description and ...` is a falsy check, so
+    # description="" skipped this length check entirely and then passed
+    # update_task_status's `is not None` guard, silently blanking the task's
+    # description with zero validation -- unlike create_manual_task, which
+    # requires and strips a non-empty description. A provided (non-None)
+    # description must be non-empty after stripping here too; None still
+    # means "leave the description untouched", per PATCH's partial-update
+    # semantics.
+    description_update = req.description
+    if req.description is not None:
+        description_update = req.description.strip()
+        if not description_update:
+            return JSONResponse({"error": "description must not be empty."}, status_code=422)
+        if len(description_update) > 500:
+            return JSONResponse({"error": "description must be at most 500 characters."}, status_code=422)
     if req.owner and len(req.owner) > 200:
         return JSONResponse({"error": "owner must be at most 200 characters."}, status_code=422)
     if req.project_id and len(req.project_id) > 100:
@@ -2107,14 +2193,22 @@ async def patch_task(task_id: str, req: TaskPatchRequest):
 
     todo_path = Path(settings.paths.data_dir) / "todo.md"
     updates = {
-        "title": req.title, "description": req.description, "owner": req.owner,
+        "title": req.title, "description": description_update, "owner": req.owner,
         "due_date": req.due_date, "priority": req.priority, "status": req.status,
         "project_id": req.project_id, "institution": req.institution, "tag": req.tag,
         "progress_note": req.progress_note, "reminder_date": req.reminder_date,
     }
     token = mint_capability_token()
     try:
-        update_task_status(
+        # Bug fix: update_task_status acquires a FileLock with a multi-second
+        # configurable timeout (config/settings.toml's lock_timeout_seconds)
+        # around a synchronous parse+rewrite of todo.md. Called directly, a
+        # contended lock (e.g. a background apply in progress) blocked the
+        # whole single-worker event loop for up to that timeout -- offloaded
+        # to a thread, matching this diff's own hardening of calendar-sync/
+        # briefing elsewhere in this file.
+        await asyncio.to_thread(
+            update_task_status,
             token, task_id, updates, todo_path,
             settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
         )
@@ -2135,7 +2229,8 @@ async def delete_task(task_id: str):
     todo_path = Path(settings.paths.data_dir) / "todo.md"
     token = mint_capability_token()
     try:
-        update_task_status(
+        await asyncio.to_thread(
+            update_task_status,
             token, task_id, {"status": "deleted"}, todo_path,
             settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
         )
@@ -2152,7 +2247,8 @@ async def duplicate_task_endpoint(task_id: str):
     todo_path = Path(settings.paths.data_dir) / "todo.md"
     token = mint_capability_token()
     try:
-        clone = duplicate_task(
+        clone = await asyncio.to_thread(
+            duplicate_task,
             token, task_id, todo_path,
             settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
         )
@@ -2178,7 +2274,8 @@ async def add_task_comment_endpoint(task_id: str, req: TaskCommentRequest):
     todo_path = Path(settings.paths.data_dir) / "todo.md"
     token = mint_capability_token()
     try:
-        item = add_task_comment(
+        item = await asyncio.to_thread(
+            add_task_comment,
             token, task_id, req.author, text, todo_path,
             settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
         )
@@ -2216,13 +2313,25 @@ async def add_task_attachment_endpoint(task_id: str, file: UploadFile = File(...
     attachments_dir = Path(settings.paths.data_dir) / "task_attachments" / task_id
     attachments_dir.mkdir(parents=True, exist_ok=True)
     dest_path = attachments_dir / filename
+    if dest_path.exists():
+        # Bug fix: uploading two different files with the same name to one
+        # task used to silently overwrite the first file's bytes on disk
+        # while todo.md still ended up with two separate attachment records
+        # both pointing at the same (now-wrong) path -- the first upload's
+        # content was permanently lost with no error surfaced. Disambiguate
+        # with a short random suffix before the extension instead.
+        from uuid import uuid4
+        stem, suffix_ext = Path(filename).stem, Path(filename).suffix
+        filename = f"{stem}-{uuid4().hex[:8]}{suffix_ext}"
+        dest_path = attachments_dir / filename
     await asyncio.to_thread(dest_path.write_bytes, content)
 
     todo_path = Path(settings.paths.data_dir) / "todo.md"
     token = mint_capability_token()
     relative_path = str(Path("task_attachments") / task_id / filename)
     try:
-        item = add_task_attachment(
+        item = await asyncio.to_thread(
+            add_task_attachment,
             token, task_id, filename, relative_path, todo_path,
             settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
         )
@@ -2258,7 +2367,8 @@ async def complete_task(req: CompleteRequest):
     todo_path = Path(settings.paths.data_dir) / "todo.md"
     token = mint_capability_token()
     try:
-        update_task_status(
+        await asyncio.to_thread(
+            update_task_status,
             token, req.task_id, {"status": "done"}, todo_path,
             settings.concurrency.lock_path, settings.concurrency.lock_timeout_seconds,
         )

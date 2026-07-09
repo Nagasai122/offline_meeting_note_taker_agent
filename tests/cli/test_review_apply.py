@@ -292,6 +292,26 @@ def test_write_manual_task_defaults_status_to_todo_when_omitted(tmp_path):
 
     item = parse_todo(dirs["todo_path"]).items[0]
     assert item.status == "todo"
+    assert item.done is False
+
+
+def test_write_manual_task_status_done_sets_done_flag(tmp_path):
+    """Regression test: a manual task created with status="done" (e.g.
+    logging already-completed work) used to leave `done` hardcoded False,
+    producing an inconsistent status="done"/done=False item that
+    cli/briefing.py's bucket_open_tasks (which filters on `done`, not
+    `status`) would keep showing as an open task on the dashboard."""
+    dirs = _dirs(tmp_path)
+    token = mint_capability_token()
+
+    write_manual_task(
+        token, {"description": "Already finished this", "status": "done"},
+        dirs["todo_path"], dirs["lock_path"], 1.0,
+    )
+
+    item = parse_todo(dirs["todo_path"]).items[0]
+    assert item.status == "done"
+    assert item.done is True
     assert item.title is None
     assert item.project_id is None
 
@@ -353,6 +373,32 @@ def test_duplicate_task_unknown_id_raises(tmp_path):
     dirs = _dirs(tmp_path)
     with pytest.raises(KeyError):
         duplicate_task(mint_capability_token(), "does-not-exist", dirs["todo_path"], dirs["lock_path"], 1.0)
+
+
+def test_duplicate_task_does_not_inherit_comments_or_attachments(tmp_path):
+    """Regression test: dataclasses.replace only overrides the fields passed
+    to it -- comments/attachments were previously left unmentioned, so the
+    clone shared the SAME list objects as the source, silently carrying over
+    the original's comment thread and file references despite this
+    function's own docstring saying a duplicate "should not inherit that
+    history"."""
+    dirs = _dirs(tmp_path)
+    write_manual_task(
+        mint_capability_token(), {"description": "Task with history"},
+        dirs["todo_path"], dirs["lock_path"], 1.0,
+    )
+    original = parse_todo(dirs["todo_path"]).items[0]
+    add_task_comment(mint_capability_token(), original.id, "Naga", "Old comment", dirs["todo_path"], dirs["lock_path"], 1.0)
+    add_task_attachment(mint_capability_token(), original.id, "old.pdf", "task_attachments/x/old.pdf", dirs["todo_path"], dirs["lock_path"], 1.0)
+
+    clone = duplicate_task(mint_capability_token(), original.id, dirs["todo_path"], dirs["lock_path"], 1.0)
+
+    assert clone.comments is None
+    assert clone.attachments is None
+    # The original itself must be untouched by the duplication.
+    original_after = next(i for i in parse_todo(dirs["todo_path"]).items if i.id == original.id)
+    assert len(original_after.comments) == 1
+    assert len(original_after.attachments) == 1
 
 
 def test_add_task_comment_appends_without_overwriting(tmp_path):
